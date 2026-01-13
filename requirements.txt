@@ -1,0 +1,14 @@
+speechrecognition
+pyttsx3
+opencv-python
+ultralytics
+huggingface-hub
+llama-cpp-python
+pyaudio
+Cython
+pybind11
+nemo_toolkit[asr]
+langchain
+langchain-ollama
+langchain-chroma
+pandas
