@@ -46,6 +46,9 @@ Visual Context (what the camera sees): {visual_context}
 
 Document Context: {context}
 
+Conversation History:
+{history}
+
 Question: {question}
 """
         self.llm = None
@@ -62,6 +65,7 @@ Question: {question}
         self.current_vision_mode = "LLM + YOLO" # 'LLM + YOLO', 'VLM', 'Hybrid'
         self.current_vlm_model = ""
         self.current_vlm_cpu_mode = False
+        self.current_pro_mode = False
 
     def run(self):
         # ---------------- HYBRID (VLM -> LLM) MODE ----------------
@@ -112,8 +116,27 @@ Question: {question}
                         pass
                 
                 final_question = self.current_question
+                # In Pro Mode, include history if possible? 
+                # VLM usually takes prompt as list of dicts. We can append history to text.
+                history_text = ""
+                if self.current_pro_mode:
+                    try:
+                         rows = database_manager.get_session_history(self.current_session_id)
+                         if rows and rows[-1][1] == self.current_question and rows[-1][0] == 'user':
+                             rows = rows[:-1]
+                         lines = []
+                         for r, c in rows:
+                             role_name = "User" if r == "user" else "Assistant"
+                             lines.append(f"{role_name}: {c}")
+                         history_text = "\n".join(lines)
+                    except Exception:
+                         pass
+
                 if context_text:
-                    final_question = f"Document Context:\n{context_text}\n\nQuestion: {final_question}"
+                    final_question = f"Document Context:\n{context_text}\n\n{final_question}"
+                
+                if history_text:
+                    final_question = f"Conversation History:\n{history_text}\n\n{final_question}"
 
                 # Construct Message
                 content_parts = [{"type": "text", "text": final_question}]
@@ -185,6 +208,25 @@ Question: {question}
                     except Exception:
                         context_text = ""
 
+                # Populate history if Pro Mode
+                history_text = ""
+                if self.current_pro_mode:
+                    try:
+                         rows = database_manager.get_session_history(self.current_session_id)
+                         # Filter out current message if present
+                         if rows and rows[-1][1] == self.current_question and rows[-1][0] == 'user':
+                             rows = rows[:-1]
+                         
+                         lines = []
+                         for r, c in rows:
+                             role_name = "User" if r == "user" else "Assistant"
+                             lines.append(f"{role_name}: {c}")
+                         
+                         if lines:
+                             history_text = "\n".join(lines)
+                    except Exception as e:
+                         print(f"History fetch error: {e}")
+
                 # Optionally include visual context
                 visual_context = self.current_visual_context if getattr(self, 'current_use_visual', True) else ""
 
@@ -194,7 +236,8 @@ Question: {question}
                     "context": context_text,
                     "question": self.current_question,
                     "visual_context": visual_context,
-                    "personality": self.current_personality
+                    "personality": self.current_personality,
+                    "history": history_text
                 })
                 print(f"LLM inference took {time.perf_counter()-t1:.2f}s")
 
@@ -205,7 +248,7 @@ Question: {question}
     def generate(self, question, visual_context, session_id, personality: str = "", 
                  use_docs: bool = True, use_visual: bool = True,
                  image_b64: str = None, vision_mode: str = "LLM + YOLO", vlm_model: str = "llava",
-                 vlm_cpu_mode: bool = False):
+                 vlm_cpu_mode: bool = False, pro_mode: bool = False):
         self.current_question = question
         self.current_visual_context = visual_context
         self.current_session_id = session_id
@@ -216,6 +259,7 @@ Question: {question}
         self.current_vision_mode = vision_mode
         self.current_vlm_model = vlm_model
         self.current_vlm_cpu_mode = vlm_cpu_mode
+        self.current_pro_mode = pro_mode
         self.start()
 
 class CameraWorker(QThread):
@@ -571,6 +615,8 @@ class AssistantSettingsDialog(QDialog):
 
         self.use_docs_cb = QCheckBox('Include Documents (RAG)')
         self.use_visual_cb = QCheckBox('Include Visual Context')
+        self.pro_mode_cb = QCheckBox('Pro Mode (Enable Session Memory)')
+        self.pro_mode_cb.setToolTip("If enabled, the assistant remembers the conversation history from the database.")
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
@@ -583,6 +629,7 @@ class AssistantSettingsDialog(QDialog):
         form.addRow('', self.vlm_cpu_cb)
         form.addRow('', self.use_docs_cb)
         form.addRow('', self.use_visual_cb)
+        form.addRow('', self.pro_mode_cb)
         form.addRow('', self.buttons)
 
         # Load settings
@@ -594,6 +641,7 @@ class AssistantSettingsDialog(QDialog):
         vision_system = settings.value('assistant/vision_system_mode', 'LLM + YOLO')
         vlm_model = settings.value('assistant/vlm_model', 'llava')
         vlm_cpu = settings.value('assistant/vlm_cpu', False, type=bool)
+        pro_mode = settings.value('assistant/pro_mode', False, type=bool)
 
         self.mode_cb.setCurrentText(mode)
         self.custom_edit.setPlainText(custom)
@@ -602,6 +650,7 @@ class AssistantSettingsDialog(QDialog):
         self.vision_system_cb.setCurrentText(vision_system)
         self.vlm_model_edit.setText(vlm_model)
         self.vlm_cpu_cb.setChecked(vlm_cpu)
+        self.pro_mode_cb.setChecked(pro_mode)
 
         # Show/hide custom field
         def on_mode_change(text):
@@ -624,7 +673,8 @@ class AssistantSettingsDialog(QDialog):
                 bool(self.use_visual_cb.isChecked()),
                 self.vision_system_cb.currentText(),
                 self.vlm_model_edit.text(),
-                bool(self.vlm_cpu_cb.isChecked()))
+                bool(self.vlm_cpu_cb.isChecked()),
+                bool(self.pro_mode_cb.isChecked()))
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -701,10 +751,16 @@ class MainWindow(QMainWindow):
         self.vision_system_mode = settings.value('assistant/vision_system_mode', 'LLM + YOLO')
         self.vlm_model_name = settings.value('assistant/vlm_model', 'llava')
         self.vlm_cpu_mode = settings.value('assistant/vlm_cpu', False, type=bool)
+        self.pro_mode = settings.value('assistant/pro_mode', False, type=bool)
         self.latest_image_b64 = None
 
         # compute actual personality text
         self.personality_text = _personality_text_from_mode(self.assistant_personality_mode, self.assistant_custom_personality)
+        
+        if self.pro_mode:
+            self.statusBar().showMessage(f"Mode: {self.vision_system_mode} | Pro Mode: ON")
+        else:
+             self.statusBar().showMessage(f"Mode: {self.vision_system_mode}")
 
     def setup_ui(self):
         # Menu Bar
@@ -889,6 +945,7 @@ class MainWindow(QMainWindow):
         vision_mode = getattr(self, 'vision_system_mode', 'LLM + YOLO')
         vlm_model = getattr(self, 'vlm_model_name', 'llava')
         vlm_cpu = getattr(self, 'vlm_cpu_mode', False)
+        pro_mode = getattr(self, 'pro_mode', False)
         personality = self.personality_text
 
         # If camera is active, we do the snapshot flow
@@ -920,7 +977,8 @@ class MainWindow(QMainWindow):
                     image_b64=getattr(self, 'latest_image_b64', None),
                     vision_mode=vision_mode,
                     vlm_model=vlm_model,
-                    vlm_cpu_mode=vlm_cpu
+                    vlm_cpu_mode=vlm_cpu,
+                    pro_mode=pro_mode
                 )
             
             worker.finished.connect(on_vision_complete)
@@ -941,7 +999,8 @@ class MainWindow(QMainWindow):
                 image_b64=None,
                 vision_mode=vision_mode,
                 vlm_model=vlm_model,
-                vlm_cpu_mode=vlm_cpu
+                vlm_cpu_mode=vlm_cpu,
+                pro_mode=pro_mode
             )
 
     def on_auto_describe_tick(self):
@@ -985,7 +1044,7 @@ class MainWindow(QMainWindow):
     def open_assistant_settings(self):
         dialog = AssistantSettingsDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            mode, custom, use_docs, use_visual, vision_sys, vlm_name, vlm_cpu = dialog.get_values()
+            mode, custom, use_docs, use_visual, vision_sys, vlm_name, vlm_cpu, pro_mode = dialog.get_values()
             settings = QSettings('YourOrg', 'SpeechToText')
             settings.setValue('assistant/personality_mode', mode)
             settings.setValue('assistant/custom_personality', custom)
@@ -994,6 +1053,7 @@ class MainWindow(QMainWindow):
             settings.setValue('assistant/vision_system_mode', vision_sys)
             settings.setValue('assistant/vlm_model', vlm_name)
             settings.setValue('assistant/vlm_cpu', vlm_cpu)
+            settings.setValue('assistant/pro_mode', pro_mode)
 
             self.assistant_personality_mode = mode
             self.assistant_custom_personality = custom
@@ -1002,9 +1062,13 @@ class MainWindow(QMainWindow):
             self.vision_system_mode = vision_sys
             self.vlm_model_name = vlm_name
             self.vlm_cpu_mode = vlm_cpu
+            self.pro_mode = pro_mode
             
             self.personality_text = _personality_text_from_mode(mode, custom)
-            self.statusBar().showMessage(f"Assistant settings saved. Mode: {vision_sys}")
+            status_msg = f"Assistant settings saved. Mode: {vision_sys}"
+            if pro_mode:
+                status_msg += " | Pro Mode: ON"
+            self.statusBar().showMessage(status_msg)
 
     def add_document(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Document", "", 

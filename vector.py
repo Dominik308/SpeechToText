@@ -69,10 +69,10 @@ def add_file_to_db(file_path):
         loader = TextLoader(file_path)
     elif file_ext == ".pdf":
         loader = PyPDFLoader(file_path)
-    # Add CSV support if needed
-    # elif file_ext == ".csv":
-    #     from langchain_community.document_loaders import CSVLoader
-    #     loader = CSVLoader(file_path)
+    # Add CSV support
+    elif file_ext == ".csv":
+        from langchain_community.document_loaders import CSVLoader
+        loader = CSVLoader(file_path)
     else:
         print(f"Unsupported file type: {file_ext}")
         return False
