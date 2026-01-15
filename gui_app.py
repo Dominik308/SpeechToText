@@ -19,6 +19,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from vector import retriever, add_file_to_db
 import database_manager
 from ultralytics import YOLO
+import threading
+import queue
+import time
 
 # Constants
 MODEL_NAME = "mirage335/Llama-3_1-8B-Instruct-abliterated-virtuoso"
@@ -56,10 +59,21 @@ Question: {question}
         # Initialize model in the thread if not already
         if not self.llm:
             try:
-                self.llm = OllamaLLM(model=self.model_name)
+                t0 = time.perf_counter()
+                # use configured params if present
+                llm_kwargs = {}
+                temp = getattr(self, 'temperature', None)
+                max_toks = getattr(self, 'max_tokens', None)
+                if temp is not None:
+                    llm_kwargs['temperature'] = float(temp)
+                if max_toks is not None:
+                    llm_kwargs['max_tokens'] = int(max_toks)
+                print(f"Initializing LLM with params: {llm_kwargs}...")
+                self.llm = OllamaLLM(model=self.model_name, **llm_kwargs)
                 prompt = ChatPromptTemplate.from_template(self.prompt_template)
                 self.chain = prompt | self.llm
                 self._is_ready = True
+                print(f"LLM initialized in {time.perf_counter()-t0:.2f}s")
             except Exception as e:
                 self.response_ready.emit(f"Error initializing LLM: {e}", "", "", "")
                 return
@@ -71,7 +85,9 @@ Question: {question}
                 context_text = ""
                 if getattr(self, 'current_use_docs', True):
                     try:
+                        t_r = time.perf_counter()
                         docs = retriever.invoke(self.current_question)
+                        print(f"Retriever took {time.perf_counter()-t_r:.2f}s")
                         context_text = "\n\n".join([doc.page_content for doc in docs])
                     except Exception:
                         context_text = ""
@@ -80,12 +96,14 @@ Question: {question}
                 visual_context = self.current_visual_context if getattr(self, 'current_use_visual', True) else ""
 
                 # Run Chain
+                t1 = time.perf_counter()
                 result = self.chain.invoke({
                     "context": context_text,
                     "question": self.current_question,
                     "visual_context": visual_context,
                     "personality": self.current_personality
                 })
+                print(f"LLM inference took {time.perf_counter()-t1:.2f}s")
 
                 self.response_ready.emit(result, context_text, visual_context, self.current_session_id)
             except Exception as e:
@@ -107,50 +125,127 @@ class CameraWorker(QThread):
     image_update = pyqtSignal(QImage)
     detections_update = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, mode='stream', frame_skip=2, downscale_width=800):
         super().__init__()
         self.running = True
+        self.mode = mode  # 'stream' or 'single'
+        self.frame_skip = frame_skip
+        self.downscale_width = downscale_width
         self.model = YOLO(YOLO_MODEL)
         self.cap = cv2.VideoCapture(0) # Default camera
+        self.latest_frame = None
 
     def run(self):
+        counter = 0
         while self.running:
             ret, frame = self.cap.read()
-            if ret:
-                # Run YOLO
-                results = self.model(frame, verbose=False)
-                
-                # Annotate frame
-                annotated_frame = results[0].plot()
-                
-                # Get detection string
-                detected_objects = []
-                for result in results:
-                    for box in result.boxes:
-                        class_id = int(box.cls[0])
-                        label = self.model.names[class_id]
-                        detected_objects.append(label)
-                
-                # Count objects
-                from collections import Counter
-                counts = Counter(detected_objects)
-                desc = ", ".join([f"{count} {obj}" for obj, count in counts.items()])
-                if not desc:
-                    desc = "nothing of note"
-                
-                self.detections_update.emit(desc)
+            if not ret:
+                continue
 
-                # Convert to Qt Image
+            # keep latest frame available for single-capture requests
+            self.latest_frame = frame
+
+            counter += 1
+
+            # In 'single' mode we only show previews but don't run the detector continuously
+            if self.mode == 'single':
+                annotated_frame = frame
+                # convert preview quickly
                 rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
                 qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
                 self.image_update.emit(qt_image.copy())
+                continue
+
+            # Throttle detection frequency
+            if counter % self.frame_skip != 0:
+                # quick preview without running detector
+                annotated_frame = frame
+                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                self.image_update.emit(qt_image.copy())
+                continue
+
+            # Resize frame to limit model cost
+            h, w = frame.shape[:2]
+            if w > self.downscale_width:
+                scale = self.downscale_width / w
+                frame_resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            else:
+                frame_resized = frame
+
+            results = self.model(frame_resized, verbose=False)
+            annotated_frame = results[0].plot()
+
+            # detection string
+            detected_objects = []
+            for result in results:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    label = self.model.names[class_id]
+                    detected_objects.append(label)
+            from collections import Counter
+            counts = Counter(detected_objects)
+            desc = ", ".join([f"{count} {obj}" for obj, count in counts.items()])
+            if not desc:
+                desc = "nothing of note"
+
+            self.detections_update.emit(desc)
+
+            rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            self.image_update.emit(qt_image.copy())
 
     def stop(self):
         self.running = False
         self.wait()
         self.cap.release()
+
+
+class SingleYOLOWorker(QThread):
+    image_update = pyqtSignal(QImage)
+    detections_update = pyqtSignal(str)
+
+    def __init__(self, model, frame):
+        super().__init__()
+        self.model = model
+        self.frame = frame
+
+    def run(self):
+        try:
+            h, w = self.frame.shape[:2]
+            if w > 800:
+                scale = 800 / w
+                frame_resized = cv2.resize(self.frame, (int(w*scale), int(h*scale)))
+            else:
+                frame_resized = self.frame
+
+            results = self.model(frame_resized, verbose=False)
+            annotated_frame = results[0].plot()
+
+            detected_objects = []
+            for result in results:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    label = self.model.names[class_id]
+                    detected_objects.append(label)
+            from collections import Counter
+            counts = Counter(detected_objects)
+            desc = ", ".join([f"{count} {obj}" for obj, count in counts.items()]) or "nothing of note"
+            self.detections_update.emit(desc)
+
+            rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            self.image_update.emit(qt_image.copy())
+        except Exception as e:
+            print("SingleYOLOWorker error:", e)
 
 
 class TTSWorker(QThread):
@@ -185,6 +280,50 @@ class TTSWorker(QThread):
             tts.runAndWait()
         except Exception as e:
             print(f"TTSWorker error: {e}")
+
+
+class TTSManager:
+    """Single long-running pyttsx3 engine with queue to avoid re-initialization cost."""
+    def __init__(self):
+        self._q = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._engine = None
+        self._thread.start()
+
+    def _get_engine(self):
+        if self._engine is None:
+            import pyttsx3
+            self._engine = pyttsx3.init()
+        return self._engine
+
+    def _run(self):
+        while True:
+            text, voice_id, rate, volume = self._q.get()
+            try:
+                engine = self._get_engine()
+                if voice_id:
+                    try:
+                        engine.setProperty('voice', voice_id)
+                    except Exception:
+                        pass
+                if rate is not None:
+                    try:
+                        engine.setProperty('rate', int(rate))
+                    except Exception:
+                        pass
+                if volume is not None:
+                    try:
+                        engine.setProperty('volume', float(volume))
+                    except Exception:
+                        pass
+                engine.say(text)
+                engine.runAndWait()
+            except Exception as e:
+                print("TTSManager error:", e)
+
+    def speak(self, text, voice_id=None, rate=None, volume=None):
+        self._q.put((text, voice_id, rate, volume))
+
 
 def _enumerate_pyttsx3_voices() -> list:
     """Return list of voice dicts: {'id','name','languages'}"""
@@ -426,6 +565,15 @@ class MainWindow(QMainWindow):
         self.llm_worker = LLMWorker(None, MODEL_NAME)
         self.llm_worker.response_ready.connect(self.handle_llm_response)
         
+        # Load LLM params from settings and assign to worker
+        settings = QSettings('YourOrg', 'SpeechToText')
+        max_toks = int(settings.value('assistant/max_tokens', 150))
+        temp = float(settings.value('assistant/temperature', 0.2))
+        self.llm_worker.max_tokens = max_toks
+        self.llm_worker.temperature = temp
+        # Pre-warm LLM to avoid first-query delay (initialization only)
+        QTimer.singleShot(1000, lambda: self.llm_worker.start())
+
         self.camera_worker = None
 
         # Try to import mp3_utils from the bundled nvidia ASR app for TTS
@@ -443,6 +591,9 @@ class MainWindow(QMainWindow):
         # TTS control
         self.speak_responses = True
         self._tts_workers = []
+
+        # single TTS manager
+        self.tts_manager = TTSManager()
 
         # Load persisted TTS settings
         settings = QSettings('YourOrg', 'SpeechToText')
@@ -534,9 +685,18 @@ class MainWindow(QMainWindow):
         self.stop_cam_btn = QPushButton("Stop Camera")
         self.stop_cam_btn.clicked.connect(self.stop_camera)
         self.stop_cam_btn.setEnabled(False)
-        
+
+        self.yolo_mode_cb = QComboBox()
+        self.yolo_mode_cb.addItems(['Stream', 'Single'])
+        self.yolo_mode_cb.currentTextChanged.connect(self.on_yolo_mode_changed)
+        self.capture_btn = QPushButton("Capture Frame")
+        self.capture_btn.setEnabled(False)
+        self.capture_btn.clicked.connect(self.capture_frame)
+
         cam_controls.addWidget(self.start_cam_btn)
         cam_controls.addWidget(self.stop_cam_btn)
+        cam_controls.addWidget(self.yolo_mode_cb)
+        cam_controls.addWidget(self.capture_btn)
         
         vision_layout.addWidget(self.camera_label)
         vision_layout.addWidget(self.vision_status)
@@ -552,13 +712,15 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
 
     def start_camera(self):
+        mode = 'stream' if self.yolo_mode_cb.currentText() == 'Stream' else 'single'
         if self.camera_worker is None or not self.camera_worker.isRunning():
-            self.camera_worker = CameraWorker()
+            self.camera_worker = CameraWorker(mode=mode)
             self.camera_worker.image_update.connect(self.update_camera_feed)
             self.camera_worker.detections_update.connect(self.update_detections)
             self.camera_worker.start()
             self.start_cam_btn.setEnabled(False)
             self.stop_cam_btn.setEnabled(True)
+            self.capture_btn.setEnabled(mode == 'Single')
 
     def stop_camera(self):
         if self.camera_worker:
@@ -566,8 +728,35 @@ class MainWindow(QMainWindow):
             self.camera_worker = None
         self.start_cam_btn.setEnabled(True)
         self.stop_cam_btn.setEnabled(False)
+        self.capture_btn.setEnabled(False)
         self.camera_label.setText("Camera Stopped")
         self.latest_visual_context = "Camera not active"
+
+    def on_yolo_mode_changed(self, text):
+        if self.camera_worker:
+            self.camera_worker.mode = 'stream' if text == 'Stream' else 'single'
+        self.capture_btn.setEnabled(text == 'Single')
+
+    def capture_frame(self):
+        # if camera running, use latest frame
+        if self.camera_worker and getattr(self.camera_worker, 'latest_frame', None) is not None:
+            frame = self.camera_worker.latest_frame.copy()
+            worker = SingleYOLOWorker(self.camera_worker.model, frame)
+            worker.image_update.connect(self.update_camera_feed)
+            worker.detections_update.connect(self.update_detections)
+            worker.start()
+        else:
+            # grab one frame with temporary capture
+            cap = cv2.VideoCapture(0)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                QMessageBox.warning(self, "Capture Failed", "Could not capture frame from camera.")
+                return
+            worker = SingleYOLOWorker(YOLO(YOLO_MODEL), frame)
+            worker.image_update.connect(self.update_camera_feed)
+            worker.detections_update.connect(self.update_detections)
+            worker.start()
 
     def update_camera_feed(self, image):
         self.camera_label.setPixmap(QPixmap.fromImage(image).scaled(
@@ -688,28 +877,17 @@ class MainWindow(QMainWindow):
         # Save to DB
         database_manager.save_message(session_id, "assistant", response, visual_context, doc_context)
 
-        # Optionally speak the response using pyttsx3 only
+        # Optionally speak the response using the long-running TTS manager
         if getattr(self, 'speak_responses', False):
             try:
-                worker = TTSWorker(
+                self.tts_manager.speak(
                     response,
                     voice_id=(self.tts_voice_id or None),
                     rate=(self.tts_rate or None),
                     volume=(self.tts_volume if hasattr(self, 'tts_volume') else None)
                 )
-                # keep a reference to prevent early GC
-                self._tts_workers.append(worker)
-
-                # cleanup when finished
-                def _on_finished():
-                    try:
-                        self._tts_workers.remove(worker)
-                    except Exception:
-                        pass
-                worker.finished.connect(_on_finished)
-                worker.start()
             except Exception as e:
-                print(f"Failed to start TTS worker: {e}")
+                print(f"Failed to enqueue TTS: {e}")
 def close_all_tts_workers(workers):
     # wait briefly for each worker to finish, then delete
     for w in list(workers):

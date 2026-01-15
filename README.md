@@ -43,3 +43,5 @@
 - Speak clearly into the microphone.
 - Say "stop system" to exit.
 - The assistant will see what is on "Cam One" and include it in its response.
+- YOLO Mode: You can choose "Stream" (continuous inference with throttling and downscale) or "Single" (capture one frame for detection using the "Capture Frame" button).
+- The LLM is pre-warmed on startup to reduce the first-query delay. TTS uses a persistent engine to avoid repeated initialization overhead.
