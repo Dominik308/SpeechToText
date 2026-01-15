@@ -7,15 +7,18 @@ import shutil
 import importlib.util
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, QSplitter,
-                             QListWidget, QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, QDialogButtonBox, QCheckBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
+                             QListWidget, QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, 
+                             QDialogButtonBox, QCheckBox, QGroupBox, QGridLayout, QSizePolicy)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings, QBuffer, QIODevice, QByteArray
 from PyQt6.QtGui import QImage, QPixmap, QAction
 
 # Import our custom modules
 # NOTE: We avoid importing main.py directly because it has a blocking loop.
 # We will replicate the LLM logic here.
 from langchain_ollama.llms import OllamaLLM
+from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
 from vector import retriever, add_file_to_db
 import database_manager
 from ultralytics import YOLO
@@ -46,6 +49,7 @@ Document Context: {context}
 Question: {question}
 """
         self.llm = None
+        self.vlm = None
         self.chain = None
         self._is_ready = False
         
@@ -54,8 +58,93 @@ Question: {question}
         self.current_visual_context = ""
         self.current_session_id = ""
         self.current_personality = ""
+        self.current_image_b64 = None
+        self.current_vision_mode = "LLM + YOLO" # 'LLM + YOLO', 'VLM', 'Hybrid'
+        self.current_vlm_model = ""
+        self.current_vlm_cpu_mode = False
 
     def run(self):
+        # ---------------- HYBRID (VLM -> LLM) MODE ----------------
+        if self.current_vision_mode == 'Hybrid (VLM -> LLM)':
+            vlm_desc = ""
+            if self.current_image_b64:
+                try:
+                    # 1. GENERATE DESCRIPTION WITH VLM
+                     if not self.vlm or getattr(self.vlm, 'model', '') != self.current_vlm_model:
+                         print(f"Initializing VLM (Hybrid) with model: {self.current_vlm_model} | CPU: {self.current_vlm_cpu_mode}")
+                         # num_gpu=0 means CPU, num_gpu=99 means max GPU
+                         gpu_layers = 0 if self.current_vlm_cpu_mode else 99
+                         self.vlm = ChatOllama(model=self.current_vlm_model, num_gpu=gpu_layers)
+                    
+                     print("Hybrid: Generating image description...")
+                     # Simple describe prompt
+                     msg = HumanMessage(content=[
+                         {"type": "text", "text": "Describe this image in detailed text."},
+                         {"type": "image_url", "image_url": f"data:image/jpeg;base64,{self.current_image_b64}"}
+                     ])
+                     resp = self.vlm.invoke([msg])
+                     vlm_desc = f"[VLM Vision]: {resp.content}"
+                     print(f"Hybrid Description: {vlm_desc[:50]}...")
+                except Exception as e:
+                    print(f"Hybrid VLM Error: {e}")
+                    vlm_desc = "[Error getting VLM description]"
+
+            # 2. Update visual context and fall through to STANDARD LLM logic
+            self.current_visual_context = vlm_desc if vlm_desc else self.current_visual_context
+
+        # ---------------- PURE VLM MODE ----------------
+        if self.current_vision_mode == 'VLM (Vision Language Model)':
+            try:
+                # Initialize VLM if needed
+                if not self.vlm or getattr(self.vlm, 'model', '') != self.current_vlm_model:
+                     print(f"Initializing VLM ChatOllama with model: {self.current_vlm_model} | CPU: {self.current_vlm_cpu_mode}")
+                     # ChatOllama for VLM
+                     gpu_layers = 0 if self.current_vlm_cpu_mode else 99
+                     self.vlm = ChatOllama(model=self.current_vlm_model, num_gpu=gpu_layers)
+
+                # RAG for VLM
+                context_text = ""
+                if getattr(self, 'current_use_docs', True) and self.current_question:
+                    try:
+                        docs = retriever.invoke(self.current_question)
+                        context_text = "\n\n".join([doc.page_content for doc in docs])
+                    except Exception:
+                        pass
+                
+                final_question = self.current_question
+                if context_text:
+                    final_question = f"Document Context:\n{context_text}\n\nQuestion: {final_question}"
+
+                # Construct Message
+                content_parts = [{"type": "text", "text": final_question}]
+                
+                # If we have an image
+                if self.current_image_b64:
+                    content_parts.append({
+                        "type": "image_url", 
+                        "image_url": f"data:image/jpeg;base64,{self.current_image_b64}"
+                    })
+                
+                # Personality can be prepended to text if needed, or system message
+                if self.current_personality:
+                     # Prepend personality to text part
+                     content_parts[0]["text"] = f"{self.current_personality}\n\n{content_parts[0]['text']}"
+
+                # Invoke
+                print("Invoking VLM...")
+                msg = HumanMessage(content=content_parts)
+                response = self.vlm.invoke([msg])
+                
+                # response.content is the string
+                result_text = response.content
+                
+                self.response_ready.emit(result_text, context_text, "[VLM Image Processed]", self.current_session_id)
+                
+            except Exception as e:
+                self.response_ready.emit(f"Error during VLM inference: {e}", "", "", "")
+            return
+
+        # ---------------- STANDARD LLM MODE ----------------
         # Initialize model in the thread if not already
         if not self.llm:
             try:
@@ -68,6 +157,10 @@ Question: {question}
                     llm_kwargs['temperature'] = float(temp)
                 if max_toks is not None:
                     llm_kwargs['max_tokens'] = int(max_toks)
+                
+                # Force GPU offloading for standard LLM as well
+                llm_kwargs['num_gpu'] = 99
+                
                 print(f"Initializing LLM with params: {llm_kwargs}...")
                 self.llm = OllamaLLM(model=self.model_name, **llm_kwargs)
                 prompt = ChatPromptTemplate.from_template(self.prompt_template)
@@ -109,28 +202,36 @@ Question: {question}
             except Exception as e:
                 self.response_ready.emit(f"Error during inference: {e}", "", "", "")
 
-    def generate(self, question, visual_context, session_id, personality: str = "", use_docs: bool = True, use_visual: bool = True):
+    def generate(self, question, visual_context, session_id, personality: str = "", 
+                 use_docs: bool = True, use_visual: bool = True,
+                 image_b64: str = None, vision_mode: str = "LLM + YOLO", vlm_model: str = "llava",
+                 vlm_cpu_mode: bool = False):
         self.current_question = question
         self.current_visual_context = visual_context
         self.current_session_id = session_id
         self.current_personality = personality
         self.current_use_docs = bool(use_docs)
         self.current_use_visual = bool(use_visual)
+        self.current_image_b64 = image_b64
+        self.current_vision_mode = vision_mode
+        self.current_vlm_model = vlm_model
+        self.current_vlm_cpu_mode = vlm_cpu_mode
         self.start()
 
 class CameraWorker(QThread):
     """
-    Captures video frames and runs YOLO inference.
+    Captures video frames for preview.
     """
     image_update = pyqtSignal(QImage)
-    detections_update = pyqtSignal(str)
 
-    def __init__(self, mode='stream', frame_skip=2, downscale_width=800):
+    def __init__(self, frame_skip=2, downscale_width=800):
         super().__init__()
         self.running = True
-        self.mode = mode  # 'stream' or 'single'
         self.frame_skip = frame_skip
         self.downscale_width = downscale_width
+        # We perform YOLO only on demand now, but keep model loaded if needed elsewhere? 
+        # Actually SingleYOLOWorker creates its own model instance which is slow.
+        # Better to share the model or keep it here. 
         self.model = YOLO(YOLO_MODEL)
         self.cap = cv2.VideoCapture(0) # Default camera
         self.latest_frame = None
@@ -142,60 +243,12 @@ class CameraWorker(QThread):
             if not ret:
                 continue
 
-            # keep latest frame available for single-capture requests
+            # keep latest frame available for snapshot requests
             self.latest_frame = frame
 
-            counter += 1
-
-            # In 'single' mode we only show previews but don't run the detector continuously
-            if self.mode == 'single':
-                annotated_frame = frame
-                # convert preview quickly
-                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                self.image_update.emit(qt_image.copy())
-                continue
-
-            # Throttle detection frequency
-            if counter % self.frame_skip != 0:
-                # quick preview without running detector
-                annotated_frame = frame
-                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                self.image_update.emit(qt_image.copy())
-                continue
-
-            # Resize frame to limit model cost
-            h, w = frame.shape[:2]
-            if w > self.downscale_width:
-                scale = self.downscale_width / w
-                frame_resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
-            else:
-                frame_resized = frame
-
-            results = self.model(frame_resized, verbose=False)
-            annotated_frame = results[0].plot()
-
-            # detection string
-            detected_objects = []
-            for result in results:
-                for box in result.boxes:
-                    class_id = int(box.cls[0])
-                    label = self.model.names[class_id]
-                    detected_objects.append(label)
-            from collections import Counter
-            counts = Counter(detected_objects)
-            desc = ", ".join([f"{count} {obj}" for obj, count in counts.items()])
-            if not desc:
-                desc = "nothing of note"
-
-            self.detections_update.emit(desc)
-
-            rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            # Just show preview
+            # We convert every frame for smooth preview
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
             qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
@@ -509,6 +562,13 @@ class AssistantSettingsDialog(QDialog):
         self.custom_edit = QTextEdit()
         self.custom_edit.setPlaceholderText('Enter custom system prompt here...')
 
+        self.vision_system_cb = QComboBox()
+        self.vision_system_cb.addItems(['LLM + YOLO', 'VLM (Vision Language Model)', 'Hybrid (VLM -> LLM)'])
+        self.vlm_model_edit = QLineEdit()
+        self.vlm_model_edit.setPlaceholderText("e.g. llava, moondream, llama3.2-vision")
+        self.vlm_cpu_cb = QCheckBox("Run VLM on CPU (Save VRAM)")
+        self.vlm_cpu_cb.setToolTip("Useful if running both models simultaneously exceeds GPU memory.")
+
         self.use_docs_cb = QCheckBox('Include Documents (RAG)')
         self.use_visual_cb = QCheckBox('Include Visual Context')
 
@@ -518,6 +578,9 @@ class AssistantSettingsDialog(QDialog):
 
         form.addRow('Personality Mode', self.mode_cb)
         form.addRow('Custom Prompt', self.custom_edit)
+        form.addRow('Vision System', self.vision_system_cb)
+        form.addRow('VLM Model Name', self.vlm_model_edit)
+        form.addRow('', self.vlm_cpu_cb)
         form.addRow('', self.use_docs_cb)
         form.addRow('', self.use_visual_cb)
         form.addRow('', self.buttons)
@@ -528,10 +591,17 @@ class AssistantSettingsDialog(QDialog):
         custom = settings.value('assistant/custom_personality', '')
         use_docs = settings.value('assistant/use_docs', True, type=bool)
         use_visual = settings.value('assistant/use_visual', True, type=bool)
+        vision_system = settings.value('assistant/vision_system_mode', 'LLM + YOLO')
+        vlm_model = settings.value('assistant/vlm_model', 'llava')
+        vlm_cpu = settings.value('assistant/vlm_cpu', False, type=bool)
+
         self.mode_cb.setCurrentText(mode)
         self.custom_edit.setPlainText(custom)
         self.use_docs_cb.setChecked(use_docs)
         self.use_visual_cb.setChecked(use_visual)
+        self.vision_system_cb.setCurrentText(vision_system)
+        self.vlm_model_edit.setText(vlm_model)
+        self.vlm_cpu_cb.setChecked(vlm_cpu)
 
         # Show/hide custom field
         def on_mode_change(text):
@@ -539,11 +609,22 @@ class AssistantSettingsDialog(QDialog):
         on_mode_change(self.mode_cb.currentText())
         self.mode_cb.currentTextChanged.connect(on_mode_change)
 
+        # Show/hide VLM model field
+        def on_vis_system_change(text):
+            is_vlm = 'VLM' in text
+            self.vlm_model_edit.setEnabled(is_vlm)
+            self.vlm_cpu_cb.setEnabled(is_vlm)
+        on_vis_system_change(self.vision_system_cb.currentText())
+        self.vision_system_cb.currentTextChanged.connect(on_vis_system_change)
+
     def get_values(self):
         return (self.mode_cb.currentText(),
                 self.custom_edit.toPlainText(),
                 bool(self.use_docs_cb.isChecked()),
-                bool(self.use_visual_cb.isChecked()))
+                bool(self.use_visual_cb.isChecked()),
+                self.vision_system_cb.currentText(),
+                self.vlm_model_edit.text(),
+                bool(self.vlm_cpu_cb.isChecked()))
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -557,6 +638,11 @@ class MainWindow(QMainWindow):
         # Session State
         self.session_id = str(uuid.uuid4())
         self.latest_visual_context = "Camera not active"
+
+        # Auto-Describe Timer
+        self.auto_timer = QTimer()
+        self.auto_timer.interval = 30000 # 30s default, can be adjusted
+        self.auto_timer.timeout.connect(self.on_auto_describe_tick)
 
         # Setup UI
         self.setup_ui()
@@ -591,6 +677,7 @@ class MainWindow(QMainWindow):
         # TTS control
         self.speak_responses = True
         self._tts_workers = []
+        self._single_shot_workers = []
 
         # single TTS manager
         self.tts_manager = TTSManager()
@@ -609,6 +696,13 @@ class MainWindow(QMainWindow):
         # Load whether to include documents/visual context
         self.use_docs = settings.value('assistant/use_docs', True, type=bool)
         self.use_visual = settings.value('assistant/use_visual', True, type=bool)
+        
+        # Vision System Settings
+        self.vision_system_mode = settings.value('assistant/vision_system_mode', 'LLM + YOLO')
+        self.vlm_model_name = settings.value('assistant/vlm_model', 'llava')
+        self.vlm_cpu_mode = settings.value('assistant/vlm_cpu', False, type=bool)
+        self.latest_image_b64 = None
+
         # compute actual personality text
         self.personality_text = _personality_text_from_mode(self.assistant_personality_mode, self.assistant_custom_personality)
 
@@ -674,34 +768,44 @@ class MainWindow(QMainWindow):
         
         self.camera_label = QLabel("Camera Feed")
         self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.camera_label.setStyleSheet("background-color: black; color: white;")
+        self.camera_label.setStyleSheet("background-color: #222; color: #aaa; border: 1px solid #444;")
+        self.camera_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.camera_label.setMinimumSize(400, 300)
         
-        self.vision_status = QLabel("Current Detection: None")
-        
-        cam_controls = QHBoxLayout()
+        # New Settings Group Layout
+        controls_group = QGroupBox("Vision Controls & Settings")
+        grid = QGridLayout()
+
+        # Camera Power
         self.start_cam_btn = QPushButton("Start Camera")
         self.start_cam_btn.clicked.connect(self.start_camera)
         self.stop_cam_btn = QPushButton("Stop Camera")
         self.stop_cam_btn.clicked.connect(self.stop_camera)
         self.stop_cam_btn.setEnabled(False)
-
-        self.yolo_mode_cb = QComboBox()
-        self.yolo_mode_cb.addItems(['Stream', 'Single'])
-        self.yolo_mode_cb.currentTextChanged.connect(self.on_yolo_mode_changed)
-        self.capture_btn = QPushButton("Capture Frame")
-        self.capture_btn.setEnabled(False)
-        self.capture_btn.clicked.connect(self.capture_frame)
-
-        cam_controls.addWidget(self.start_cam_btn)
-        cam_controls.addWidget(self.stop_cam_btn)
-        cam_controls.addWidget(self.yolo_mode_cb)
-        cam_controls.addWidget(self.capture_btn)
         
-        vision_layout.addWidget(self.camera_label)
-        vision_layout.addWidget(self.vision_status)
-        vision_layout.addLayout(cam_controls)
-        vision_layout.addStretch()
+        # Auto Describe
+        self.auto_desc_cb = QCheckBox("Auto-Describe (30s)")
+        self.auto_desc_cb.toggled.connect(self.toggle_auto_describe)
+
+        # Status
+        self.vision_status = QLabel("Detection: None")
+        self.vision_status.setWordWrap(True)
+
+        # Grid Placement
+        # Row 0: Camera Power
+        grid.addWidget(self.start_cam_btn, 0, 0)
+        grid.addWidget(self.stop_cam_btn, 0, 1)
+
+        # Row 2: Features
+        grid.addWidget(self.auto_desc_cb, 1, 0, 1, 2)
+        
+        # Row 3: Status
+        grid.addWidget(self.vision_status, 2, 0, 1, 2)
+
+        controls_group.setLayout(grid)
+        
+        vision_layout.addWidget(self.camera_label, stretch=3)
+        vision_layout.addWidget(controls_group, stretch=1)
 
         # Add to splitter
         splitter.addWidget(chat_widget)
@@ -712,15 +816,13 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
 
     def start_camera(self):
-        mode = 'stream' if self.yolo_mode_cb.currentText() == 'Stream' else 'single'
         if self.camera_worker is None or not self.camera_worker.isRunning():
-            self.camera_worker = CameraWorker(mode=mode)
+            self.camera_worker = CameraWorker()
             self.camera_worker.image_update.connect(self.update_camera_feed)
-            self.camera_worker.detections_update.connect(self.update_detections)
+            # Detections are now demand-based, so no signal connection here for detections
             self.camera_worker.start()
             self.start_cam_btn.setEnabled(False)
             self.stop_cam_btn.setEnabled(True)
-            self.capture_btn.setEnabled(mode == 'Single')
 
     def stop_camera(self):
         if self.camera_worker:
@@ -728,43 +830,130 @@ class MainWindow(QMainWindow):
             self.camera_worker = None
         self.start_cam_btn.setEnabled(True)
         self.stop_cam_btn.setEnabled(False)
-        self.capture_btn.setEnabled(False)
         self.camera_label.setText("Camera Stopped")
         self.latest_visual_context = "Camera not active"
 
-    def on_yolo_mode_changed(self, text):
-        if self.camera_worker:
-            self.camera_worker.mode = 'stream' if text == 'Stream' else 'single'
-        self.capture_btn.setEnabled(text == 'Single')
+    # on_yolo_mode_changed removed
+    # capture_frame removed
 
-    def capture_frame(self):
-        # if camera running, use latest frame
-        if self.camera_worker and getattr(self.camera_worker, 'latest_frame', None) is not None:
-            frame = self.camera_worker.latest_frame.copy()
-            worker = SingleYOLOWorker(self.camera_worker.model, frame)
-            worker.image_update.connect(self.update_camera_feed)
-            worker.detections_update.connect(self.update_detections)
-            worker.start()
-        else:
-            # grab one frame with temporary capture
-            cap = cv2.VideoCapture(0)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret:
-                QMessageBox.warning(self, "Capture Failed", "Could not capture frame from camera.")
-                return
-            worker = SingleYOLOWorker(YOLO(YOLO_MODEL), frame)
-            worker.image_update.connect(self.update_camera_feed)
-            worker.detections_update.connect(self.update_detections)
-            worker.start()
+    def _start_single_worker(self, worker):
+        # We don't connect image_update/detections_update here generically anymore
+        # because the caller might want specific binding (or we bind them in caller)
+        # But for 'capture_frame' replacement logic, we want consistent behavior.
+        
+        # Ensure we keep reference
+        self._single_shot_workers.append(worker)
+        worker.start()
+
+    def _cleanup_single_worker(self, worker):
+        if worker in self._single_shot_workers:
+            self._single_shot_workers.remove(worker)
+        worker.deleteLater()
 
     def update_camera_feed(self, image):
-        self.camera_label.setPixmap(QPixmap.fromImage(image).scaled(
-            self.camera_label.width(), self.camera_label.height(), Qt.AspectRatioMode.KeepAspectRatio))
+        # Scale properly with aspect ratio
+        if not self.camera_label.size().isEmpty():
+             pixmap = QPixmap.fromImage(image)
+             scaled = pixmap.scaled(self.camera_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+             self.camera_label.setPixmap(scaled)
+        
+        # Store for VLM usage
+        try:
+            ba = QByteArray()
+            buffer = QBuffer(ba)
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            image.save(buffer, "JPG")
+            self.latest_image_b64 = ba.toBase64().data().decode('utf-8')
+        except Exception:
+            pass
 
     def update_detections(self, desc):
         self.latest_visual_context = desc
-        self.vision_status.setText(f"Seeing: {desc}")
+        self.vision_status.setText(f"Detection: {desc}")
+
+    def toggle_auto_describe(self, checked):
+        if checked:
+            self.auto_timer.start(30000) # 30s
+            # Trigger immediately only if camera is running
+            if self.camera_worker and self.camera_worker.isRunning():
+                 self.on_auto_describe_tick()
+        else:
+            self.auto_timer.stop()
+
+    def _generate_with_active_vision(self, prompt_text, is_auto=False):
+        """
+        Helper to grab a snapshot, run YOLO (single shot), and then trigger LLM generation.
+        Ensures 'only one image' is used per response.
+        """
+        # Common params
+        vision_mode = getattr(self, 'vision_system_mode', 'LLM + YOLO')
+        vlm_model = getattr(self, 'vlm_model_name', 'llava')
+        vlm_cpu = getattr(self, 'vlm_cpu_mode', False)
+        personality = self.personality_text
+
+        # If camera is active, we do the snapshot flow
+        if self.camera_worker and self.camera_worker.isRunning() and self.camera_worker.latest_frame is not None:
+            # 1. Grab Frame
+            frame = self.camera_worker.latest_frame.copy()
+            
+            # 2. Run YOLO Analysis (Single Shot)
+            # We reuse the model loaded in CameraWorker (it's idle since we stopped stream inference)
+            worker = SingleYOLOWorker(self.camera_worker.model, frame)
+            
+            # 3. Connect signals
+            # Update UI detection label and internal context
+            worker.detections_update.connect(self.update_detections)
+            # Update camera feed with the annotated frame so user sees what was captured
+            worker.image_update.connect(self.update_camera_feed)
+            
+            def on_vision_complete():
+                self._cleanup_single_worker(worker)
+                
+                # Now trigger LLM with the updated context/image
+                self.llm_worker.generate(
+                    prompt_text,
+                    self.latest_visual_context,
+                    self.session_id,
+                    personality=personality,
+                    use_docs=self.use_docs,
+                    use_visual=True,
+                    image_b64=getattr(self, 'latest_image_b64', None),
+                    vision_mode=vision_mode,
+                    vlm_model=vlm_model,
+                    vlm_cpu_mode=vlm_cpu
+                )
+            
+            worker.finished.connect(on_vision_complete)
+            self._start_single_worker(worker)
+            
+            if not is_auto:
+                self.chat_display.append("<i>System: Capturing and analyzing scene...</i>")
+
+        else:
+            # Fallback if no camera
+            self.llm_worker.generate(
+                prompt_text,
+                self.latest_visual_context,
+                self.session_id,
+                personality=personality,
+                use_docs=self.use_docs,
+                use_visual=self.use_visual,
+                image_b64=None,
+                vision_mode=vision_mode,
+                vlm_model=vlm_model,
+                vlm_cpu_mode=vlm_cpu
+            )
+
+    def on_auto_describe_tick(self):
+        if not self.camera_worker or not self.camera_worker.isRunning():
+            return
+        
+        # Don't interrupt if already busy processing a request
+        if self.llm_worker.isRunning():
+            return
+
+        self.chat_display.append(f"<i>System: Auto-Analyzing Scene...</i>")
+        self._generate_with_active_vision("Describe the current scene and what is happening in it.", is_auto=True)
 
     def open_voice_settings(self):
         dialog = VoiceSettingsDialog(self)
@@ -796,18 +985,26 @@ class MainWindow(QMainWindow):
     def open_assistant_settings(self):
         dialog = AssistantSettingsDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            mode, custom, use_docs, use_visual = dialog.get_values()
+            mode, custom, use_docs, use_visual, vision_sys, vlm_name, vlm_cpu = dialog.get_values()
             settings = QSettings('YourOrg', 'SpeechToText')
             settings.setValue('assistant/personality_mode', mode)
             settings.setValue('assistant/custom_personality', custom)
             settings.setValue('assistant/use_docs', use_docs)
             settings.setValue('assistant/use_visual', use_visual)
+            settings.setValue('assistant/vision_system_mode', vision_sys)
+            settings.setValue('assistant/vlm_model', vlm_name)
+            settings.setValue('assistant/vlm_cpu', vlm_cpu)
+
             self.assistant_personality_mode = mode
             self.assistant_custom_personality = custom
             self.use_docs = bool(use_docs)
             self.use_visual = bool(use_visual)
+            self.vision_system_mode = vision_sys
+            self.vlm_model_name = vlm_name
+            self.vlm_cpu_mode = vlm_cpu
+            
             self.personality_text = _personality_text_from_mode(mode, custom)
-            self.statusBar().showMessage(f"Assistant personality set: {mode}")
+            self.statusBar().showMessage(f"Assistant settings saved. Mode: {vision_sys}")
 
     def add_document(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Document", "", 
@@ -846,8 +1043,11 @@ class MainWindow(QMainWindow):
         self.chat_display.append(f"<b>You:</b> {text}")
         self.input_field.clear()
         
-        # Determine visual context
+        # Determine visual context (use latest for now, but will be updated if vision is active)
         vis_context = self.latest_visual_context
+
+        # Determine VLM usage
+        vision_mode = getattr(self, 'vision_system_mode', 'LLM + YOLO')
         
         # Save user message to DB
         # Note: We save document_context as "PENDING" or empty for user msg, 
@@ -857,15 +1057,8 @@ class MainWindow(QMainWindow):
         # Signal loading
         self.chat_display.append("<i>Assistant is thinking...</i>")
         
-        # Run worker (include selected personality text)
-        self.llm_worker.generate(
-            text,
-            vis_context,
-            self.session_id,
-            personality=self.personality_text,
-            use_docs=self.use_docs,
-            use_visual=self.use_visual
-        )
+        # Trigger the generation pipeline (Snapshot -> YOLO -> LLM)
+        self._generate_with_active_vision(text)
 
     def handle_llm_response(self, response, doc_context, visual_context, session_id):
         # Remove "thinking" line approximately (simplification)
