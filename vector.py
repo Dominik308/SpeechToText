@@ -1,90 +1,110 @@
-from langchain_ollama import OllamaEmbeddings
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import DirectoryLoader, TextLoader, PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+"""
+Vector store (RAG) for the assistant.
+
+All documents live in ./documents. On startup every file in that folder that is
+not yet in the vector database is indexed, so the database can always be rebuilt
+by deleting the database folder.
+"""
 import os
 
-# Define the embedding model
-embeddings = OllamaEmbeddings(model="bge-m3")
+from langchain_ollama import OllamaEmbeddings
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import CSVLoader, PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Define the database location
-db_location = "./chrome_langchain_db"
+EMBEDDING_MODEL = "bge-m3"
+DB_LOCATION = "./chrome_langchain_db"
+DOCUMENTS_PATH = "./documents"
+SUPPORTED_EXTENSIONS = (".txt", ".md", ".pdf", ".csv")
 
-# Initialize the vector store
+embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+
 vector_store = Chroma(
     collection_name="rag_collection",
-    persist_directory=db_location,
-    embedding_function=embeddings
+    persist_directory=DB_LOCATION,
+    embedding_function=embeddings,
 )
 
-documents_path = "./documents"
-if not os.path.exists(documents_path):
-    os.makedirs(documents_path)
+_text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
-# Only process if DB seems new (folder doesn't exist)
-if not os.path.exists(db_location):
-    print("Initializing vector database...")
-    loaders = [
-        DirectoryLoader(documents_path, glob="**/*.txt", loader_cls=TextLoader),
-        DirectoryLoader(documents_path, glob="**/*.md", loader_cls=TextLoader),
-        DirectoryLoader(documents_path, glob="**/*.pdf", loader_cls=PyPDFLoader)
-    ]
-    docs = []
-    for loader in loaders:
-        try:
-            print(f"Loading files with {loader.loader_cls.__name__}...")
-            loaded_docs = loader.load()
-            docs.extend(loaded_docs)
-            print(f"Loaded {len(loaded_docs)} documents.")
-        except Exception as e:
-            print(f"Error loading files with {loader}: {e}")
 
-    if docs:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(docs)
-        vector_store.add_documents(documents=splits)
-        print(f"Added {len(splits)} chunks to the database.")
-    else:
-        print("No documents found to add. Place .txt, .md, or .pdf files in the 'documents' folder and delete the 'chrome_langchain_db' folder to try again.")
-else:
-    print("Vector database already exists. Using existing data.")
-    print("To refresh data: Delete the 'chrome_langchain_db' folder and run this script again.")
+def _normalize(path):
+    return os.path.normpath(path)
 
-retriever = vector_store.as_retriever(
-    search_kwargs={"k": 5}
-)
+
+def _get_loader(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".txt", ".md"):
+        return TextLoader(file_path, encoding="utf-8", autodetect_encoding=True)
+    if ext == ".pdf":
+        return PyPDFLoader(file_path)
+    if ext == ".csv":
+        return CSVLoader(file_path, autodetect_encoding=True)
+    return None
+
+
+def _source_ids(source):
+    """Return the chunk ids that belong to a given source file."""
+    return vector_store.get(where={"source": source}, include=[])["ids"]
+
 
 def add_file_to_db(file_path):
     """
-    Adds a single file to the vector database.
+    Adds (or re-indexes) a single file in the vector database.
+    Existing chunks of the same file are replaced, so adding a file twice
+    does not create duplicate results.
     """
     if not os.path.exists(file_path):
         print(f"File not found: {file_path}")
         return False
-        
-    file_ext = os.path.splitext(file_path)[1].lower()
-    loader = None
-    
-    if file_ext == ".txt" or file_ext == ".md":
-        loader = TextLoader(file_path)
-    elif file_ext == ".pdf":
-        loader = PyPDFLoader(file_path)
-    # Add CSV support if needed
-    # elif file_ext == ".csv":
-    #     from langchain_community.document_loaders import CSVLoader
-    #     loader = CSVLoader(file_path)
-    else:
-        print(f"Unsupported file type: {file_ext}")
+
+    loader = _get_loader(file_path)
+    if loader is None:
+        print(f"Unsupported file type: {os.path.splitext(file_path)[1]}")
         return False
-        
+
+    source = _normalize(file_path)
     try:
         print(f"Processing {file_path}...")
         docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(docs)
-        vector_store.add_documents(documents=splits)
-        print(f"Successfully added {file_path} to database.")
+        for doc in docs:
+            doc.metadata["source"] = source
+        splits = _text_splitter.split_documents(docs)
+
+        old_ids = _source_ids(source)
+        if old_ids:
+            vector_store.delete(ids=old_ids)
+        if splits:
+            vector_store.add_documents(documents=splits)
+        print(f"Successfully added {file_path} ({len(splits)} chunks).")
         return True
     except Exception as e:
-        print(f"Error adding file: {e}")
+        print(f"Error adding file {file_path}: {e}")
         return False
+
+
+def sync_documents_folder():
+    """Index every supported file in DOCUMENTS_PATH that is not in the database yet."""
+    os.makedirs(DOCUMENTS_PATH, exist_ok=True)
+    added = 0
+    for root, _dirs, files in os.walk(DOCUMENTS_PATH):
+        for name in sorted(files):
+            if not name.lower().endswith(SUPPORTED_EXTENSIONS):
+                continue
+            path = _normalize(os.path.join(root, name))
+            try:
+                if _source_ids(path):
+                    continue
+            except Exception as e:
+                print(f"Could not query vector database: {e}")
+                return added
+            if add_file_to_db(path):
+                added += 1
+    if added:
+        print(f"Indexed {added} new document(s) from {DOCUMENTS_PATH}.")
+    return added
+
+
+sync_documents_folder()
+
+retriever = vector_store.as_retriever(search_kwargs={"k": 5})

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local models and runtime data (never commit)
+models/
+*.pt
+*.gguf
+chat_history.db
+chrome_langchain_db/
+documents/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

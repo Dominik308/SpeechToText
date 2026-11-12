@@ -1,3 +1,6 @@
+# LEGACY: Old console voice assistant (llama-cpp + Google speech recognition).
+# Superseded by gui_app.py; kept for reference until voice input is integrated into the GUI.
+# Note: needs llama-cpp-python, which is no longer part of requirements.txt.
 import speech_recognition as sr
 import pyttsx3
 import cv2

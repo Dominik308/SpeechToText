@@ -1,42 +1,67 @@
 import sys
 import os
-import cv2
-import datetime
+import html
 import uuid
 import shutil
-import importlib.util
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+import queue
+import threading
+import time
+from collections import Counter
+
+import cv2
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, QSplitter,
-                             QListWidget, QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, QDialogButtonBox, QCheckBox)
+                             QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, QDialogButtonBox, QCheckBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QImage, QPixmap, QAction
 
-# Import our custom modules
 # NOTE: We avoid importing main.py directly because it has a blocking loop.
-# We will replicate the LLM logic here.
+# The LLM logic is replicated in LLMWorker.
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
-from vector import retriever, add_file_to_db
+from vector import retriever, add_file_to_db, DOCUMENTS_PATH
 import database_manager
 from ultralytics import YOLO
-import threading
-import queue
-import time
 
 # Constants
 MODEL_NAME = "mirage335/Llama-3_1-8B-Instruct-abliterated-virtuoso"
 YOLO_MODEL = "yolov8n.pt"
 
+
+def describe_detections(model, results):
+    """Turn YOLO results into a short text like '2 person, 1 cup'."""
+    labels = []
+    for result in results:
+        for box in result.boxes:
+            labels.append(model.names[int(box.cls[0])])
+    counts = Counter(labels)
+    return ", ".join(f"{count} {obj}" for obj, count in counts.items()) or "nothing of note"
+
+
+def frame_to_qimage(frame):
+    rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w, ch = rgb_image.shape
+    return QImage(rgb_image.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+
+
+def downscale(frame, max_width):
+    h, w = frame.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        return cv2.resize(frame, (int(w * scale), int(h * scale)))
+    return frame
+
+
 class LLMWorker(QThread):
     """
-    Runs the LLM inference in a background thread to prevent freezing the GUI.
-    """
-    response_ready = pyqtSignal(str, str, str, str) # response, context_text, visual_context, session_id
+    Long-running background thread for LLM inference.
 
-    def __init__(self, start_signal, model_name):
-        super().__init__()
-        self.model_name = model_name
-        self.prompt_template = """
+    Requests are queued, so a message sent while the model is still loading or
+    answering a previous question is processed afterwards instead of being lost.
+    """
+    response_ready = pyqtSignal(str, str, str, str)  # response, context_text, visual_context, session_id
+
+    PROMPT_TEMPLATE = """
 {personality}
 
 Visual Context (what the camera sees): {visual_context}
@@ -45,78 +70,111 @@ Document Context: {context}
 
 Question: {question}
 """
-        self.llm = None
+
+    def __init__(self, model_name, temperature=None, num_predict=None):
+        super().__init__()
+        self.model_name = model_name
+        self.temperature = temperature
+        self.num_predict = num_predict
         self.chain = None
-        self._is_ready = False
-        
-        # We need to store request data
-        self.current_question = ""
-        self.current_visual_context = ""
-        self.current_session_id = ""
-        self.current_personality = ""
+        self._init_error = ""
+        self._requests = queue.Queue()
+
+    def _init_llm(self):
+        try:
+            t0 = time.perf_counter()
+            llm_kwargs = {}
+            if self.temperature is not None:
+                llm_kwargs['temperature'] = float(self.temperature)
+            if self.num_predict is not None:
+                # Ollama's name for the maximum number of generated tokens
+                llm_kwargs['num_predict'] = int(self.num_predict)
+            print(f"Initializing LLM with params: {llm_kwargs}...")
+            llm = OllamaLLM(model=self.model_name, **llm_kwargs)
+            self.chain = ChatPromptTemplate.from_template(self.PROMPT_TEMPLATE) | llm
+            print(f"LLM initialized in {time.perf_counter()-t0:.2f}s")
+        except Exception as e:
+            self._init_error = str(e)
+            print(f"Error initializing LLM: {e}")
+            return
+
+        # Pre-warm: make Ollama load the model into (GPU) memory now,
+        # so the first real question does not pay the loading time.
+        try:
+            import ollama
+            t0 = time.perf_counter()
+            ollama.generate(model=self.model_name, prompt="")
+            print(f"LLM model loaded by Ollama in {time.perf_counter()-t0:.2f}s")
+        except Exception as e:
+            print(f"LLM pre-warm skipped: {e}")
 
     def run(self):
-        # Initialize model in the thread if not already
-        if not self.llm:
-            try:
-                t0 = time.perf_counter()
-                # use configured params if present
-                llm_kwargs = {}
-                temp = getattr(self, 'temperature', None)
-                max_toks = getattr(self, 'max_tokens', None)
-                if temp is not None:
-                    llm_kwargs['temperature'] = float(temp)
-                if max_toks is not None:
-                    llm_kwargs['max_tokens'] = int(max_toks)
-                print(f"Initializing LLM with params: {llm_kwargs}...")
-                self.llm = OllamaLLM(model=self.model_name, **llm_kwargs)
-                prompt = ChatPromptTemplate.from_template(self.prompt_template)
-                self.chain = prompt | self.llm
-                self._is_ready = True
-                print(f"LLM initialized in {time.perf_counter()-t0:.2f}s")
-            except Exception as e:
-                self.response_ready.emit(f"Error initializing LLM: {e}", "", "", "")
-                return
+        self._init_llm()
+        while True:
+            request = self._requests.get()
+            if request is None:  # stop signal
+                break
+            self._process(request)
 
-        # Perform inference
-        if self.current_question:
-            try:
-                # Optionally retrieve document context (RAG)
-                context_text = ""
-                if getattr(self, 'current_use_docs', True):
-                    try:
-                        t_r = time.perf_counter()
-                        docs = retriever.invoke(self.current_question)
-                        print(f"Retriever took {time.perf_counter()-t_r:.2f}s")
-                        context_text = "\n\n".join([doc.page_content for doc in docs])
-                    except Exception:
-                        context_text = ""
+    def _process(self, req):
+        session_id = req['session_id']
+        if self.chain is None:
+            self.response_ready.emit(f"Error initializing LLM: {self._init_error}", "", "", session_id)
+            return
+        try:
+            context_text = ""
+            if req['use_docs']:
+                try:
+                    t_r = time.perf_counter()
+                    docs = retriever.invoke(req['question'])
+                    print(f"Retriever took {time.perf_counter()-t_r:.2f}s")
+                    context_text = "\n\n".join(doc.page_content for doc in docs)
+                except Exception as e:
+                    print(f"Retriever error (continuing without documents): {e}")
 
-                # Optionally include visual context
-                visual_context = self.current_visual_context if getattr(self, 'current_use_visual', True) else ""
+            visual_context = req['visual_context'] if req['use_visual'] else ""
 
-                # Run Chain
-                t1 = time.perf_counter()
-                result = self.chain.invoke({
-                    "context": context_text,
-                    "question": self.current_question,
-                    "visual_context": visual_context,
-                    "personality": self.current_personality
-                })
-                print(f"LLM inference took {time.perf_counter()-t1:.2f}s")
-
-                self.response_ready.emit(result, context_text, visual_context, self.current_session_id)
-            except Exception as e:
-                self.response_ready.emit(f"Error during inference: {e}", "", "", "")
+            t1 = time.perf_counter()
+            result = self.chain.invoke({
+                "context": context_text,
+                "question": req['question'],
+                "visual_context": visual_context,
+                "personality": req['personality'],
+            })
+            print(f"LLM inference took {time.perf_counter()-t1:.2f}s")
+            self.response_ready.emit(result, context_text, visual_context, session_id)
+        except Exception as e:
+            self.response_ready.emit(f"Error during inference: {e}", "", "", session_id)
 
     def generate(self, question, visual_context, session_id, personality: str = "", use_docs: bool = True, use_visual: bool = True):
-        self.current_question = question
-        self.current_visual_context = visual_context
-        self.current_session_id = session_id
-        self.current_personality = personality
-        self.current_use_docs = bool(use_docs)
-        self.current_use_visual = bool(use_visual)
-        self.start()
+        self._requests.put({
+            'question': question,
+            'visual_context': visual_context,
+            'session_id': session_id,
+            'personality': personality,
+            'use_docs': bool(use_docs),
+            'use_visual': bool(use_visual),
+        })
+        if not self.isRunning():
+            self.start()
+
+    def stop(self, timeout_ms=5000):
+        self._requests.put(None)
+        self.wait(timeout_ms)
+
+
+class IngestWorker(QThread):
+    """Indexes a document in the background so the GUI does not freeze."""
+    ingest_finished = pyqtSignal(str, bool)  # filename, success
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        ok = add_file_to_db(self.file_path)
+        self.ingest_finished.emit(os.path.basename(self.file_path), ok)
+
 
 class CameraWorker(QThread):
     """
@@ -124,87 +182,57 @@ class CameraWorker(QThread):
     """
     image_update = pyqtSignal(QImage)
     detections_update = pyqtSignal(str)
+    camera_error = pyqtSignal(str)
 
-    def __init__(self, mode='stream', frame_skip=2, downscale_width=800):
+    def __init__(self, model, mode='stream', frame_skip=2, downscale_width=800):
         super().__init__()
         self.running = True
         self.mode = mode  # 'stream' or 'single'
         self.frame_skip = frame_skip
         self.downscale_width = downscale_width
-        self.model = YOLO(YOLO_MODEL)
-        self.cap = cv2.VideoCapture(0) # Default camera
+        self.model = model
+        self.cap = None
         self.latest_frame = None
 
     def run(self):
+        self.cap = cv2.VideoCapture(0)  # Default camera
+        if not self.cap.isOpened():
+            self.camera_error.emit("Could not open camera.")
+            self.cap.release()
+            return
+
         counter = 0
+        failed_reads = 0
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
+                failed_reads += 1
+                if failed_reads > 100:
+                    self.camera_error.emit("Camera stopped delivering frames.")
+                    break
+                time.sleep(0.02)
                 continue
+            failed_reads = 0
 
             # keep latest frame available for single-capture requests
             self.latest_frame = frame
-
             counter += 1
 
-            # In 'single' mode we only show previews but don't run the detector continuously
-            if self.mode == 'single':
-                annotated_frame = frame
-                # convert preview quickly
-                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                self.image_update.emit(qt_image.copy())
+            # In 'single' mode we only show previews; detection happens on "Capture Frame".
+            # In 'stream' mode detection is throttled to every n-th frame.
+            if self.mode == 'single' or counter % self.frame_skip != 0:
+                self.image_update.emit(frame_to_qimage(frame))
                 continue
 
-            # Throttle detection frequency
-            if counter % self.frame_skip != 0:
-                # quick preview without running detector
-                annotated_frame = frame
-                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                self.image_update.emit(qt_image.copy())
-                continue
+            results = self.model(downscale(frame, self.downscale_width), verbose=False)
+            self.detections_update.emit(describe_detections(self.model, results))
+            self.image_update.emit(frame_to_qimage(results[0].plot()))
 
-            # Resize frame to limit model cost
-            h, w = frame.shape[:2]
-            if w > self.downscale_width:
-                scale = self.downscale_width / w
-                frame_resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
-            else:
-                frame_resized = frame
-
-            results = self.model(frame_resized, verbose=False)
-            annotated_frame = results[0].plot()
-
-            # detection string
-            detected_objects = []
-            for result in results:
-                for box in result.boxes:
-                    class_id = int(box.cls[0])
-                    label = self.model.names[class_id]
-                    detected_objects.append(label)
-            from collections import Counter
-            counts = Counter(detected_objects)
-            desc = ", ".join([f"{count} {obj}" for obj, count in counts.items()])
-            if not desc:
-                desc = "nothing of note"
-
-            self.detections_update.emit(desc)
-
-            rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            self.image_update.emit(qt_image.copy())
+        self.cap.release()
 
     def stop(self):
         self.running = False
         self.wait()
-        self.cap.release()
 
 
 class SingleYOLOWorker(QThread):
@@ -218,32 +246,9 @@ class SingleYOLOWorker(QThread):
 
     def run(self):
         try:
-            h, w = self.frame.shape[:2]
-            if w > 800:
-                scale = 800 / w
-                frame_resized = cv2.resize(self.frame, (int(w*scale), int(h*scale)))
-            else:
-                frame_resized = self.frame
-
-            results = self.model(frame_resized, verbose=False)
-            annotated_frame = results[0].plot()
-
-            detected_objects = []
-            for result in results:
-                for box in result.boxes:
-                    class_id = int(box.cls[0])
-                    label = self.model.names[class_id]
-                    detected_objects.append(label)
-            from collections import Counter
-            counts = Counter(detected_objects)
-            desc = ", ".join([f"{count} {obj}" for obj, count in counts.items()]) or "nothing of note"
-            self.detections_update.emit(desc)
-
-            rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            self.image_update.emit(qt_image.copy())
+            results = self.model(downscale(self.frame, 800), verbose=False)
+            self.detections_update.emit(describe_detections(self.model, results))
+            self.image_update.emit(frame_to_qimage(results[0].plot()))
         except Exception as e:
             print("SingleYOLOWorker error:", e)
 
@@ -562,37 +567,24 @@ class MainWindow(QMainWindow):
         self.setup_ui()
 
         # Setup Workers
-        self.llm_worker = LLMWorker(None, MODEL_NAME)
-        self.llm_worker.response_ready.connect(self.handle_llm_response)
-        
-        # Load LLM params from settings and assign to worker
         settings = QSettings('YourOrg', 'SpeechToText')
-        max_toks = int(settings.value('assistant/max_tokens', 150))
-        temp = float(settings.value('assistant/temperature', 0.2))
-        self.llm_worker.max_tokens = max_toks
-        self.llm_worker.temperature = temp
-        # Pre-warm LLM to avoid first-query delay (initialization only)
-        QTimer.singleShot(1000, lambda: self.llm_worker.start())
+        self.llm_worker = LLMWorker(
+            MODEL_NAME,
+            temperature=float(settings.value('assistant/temperature', 0.2)),
+            num_predict=int(settings.value('assistant/max_tokens', 150)),
+        )
+        self.llm_worker.response_ready.connect(self.handle_llm_response)
+        self.pending_requests = 0
+        # Pre-warm LLM to avoid first-query delay
+        QTimer.singleShot(1000, self.llm_worker.start)
 
         self.camera_worker = None
-
-        # Try to import mp3_utils from the bundled nvidia ASR app for TTS
-        try:
-            mp3_path = os.path.join(os.path.dirname(__file__), "nvidia_asr_app-main", "mp3_utils.py")
-            spec = importlib.util.spec_from_file_location("nvidia_mp3_utils", mp3_path)
-            mp3_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mp3_module)
-            self.mp3_utils = mp3_module
-            print("Loaded mp3_utils from nvidia_asr_app-main")
-        except Exception as e:
-            print(f"Could not load mp3_utils: {e}")
-            self.mp3_utils = None
+        self._yolo_model = None
+        # Keep references to short-lived worker threads until they finish
+        self._bg_workers = []
 
         # TTS control
         self.speak_responses = True
-        self._tts_workers = []
-
-        # single TTS manager
         self.tts_manager = TTSManager()
 
         # Load persisted TTS settings
@@ -711,16 +703,36 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(splitter)
 
+    @property
+    def yolo_model(self):
+        """YOLO model, loaded once on first use and shared by all camera workers."""
+        if self._yolo_model is None:
+            self._yolo_model = YOLO(YOLO_MODEL)
+        return self._yolo_model
+
+    def _start_bg_worker(self, worker):
+        """Start a short-lived QThread and keep a reference until it has finished."""
+        self._bg_workers.append(worker)
+
+        def _cleanup():
+            if worker in self._bg_workers:
+                self._bg_workers.remove(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(_cleanup)
+        worker.start()
+
     def start_camera(self):
         mode = 'stream' if self.yolo_mode_cb.currentText() == 'Stream' else 'single'
         if self.camera_worker is None or not self.camera_worker.isRunning():
-            self.camera_worker = CameraWorker(mode=mode)
+            self.camera_worker = CameraWorker(self.yolo_model, mode=mode)
             self.camera_worker.image_update.connect(self.update_camera_feed)
             self.camera_worker.detections_update.connect(self.update_detections)
+            self.camera_worker.camera_error.connect(self.on_camera_error)
             self.camera_worker.start()
             self.start_cam_btn.setEnabled(False)
             self.stop_cam_btn.setEnabled(True)
-            self.capture_btn.setEnabled(mode == 'Single')
+            self.capture_btn.setEnabled(mode == 'single')
 
     def stop_camera(self):
         if self.camera_worker:
@@ -728,9 +740,15 @@ class MainWindow(QMainWindow):
             self.camera_worker = None
         self.start_cam_btn.setEnabled(True)
         self.stop_cam_btn.setEnabled(False)
-        self.capture_btn.setEnabled(False)
+        self.capture_btn.setEnabled(self.yolo_mode_cb.currentText() == 'Single')
         self.camera_label.setText("Camera Stopped")
         self.latest_visual_context = "Camera not active"
+        self.vision_status.setText("Current Detection: None")
+
+    def on_camera_error(self, message):
+        self.stop_camera()
+        self.camera_label.setText(message)
+        self.statusBar().showMessage(message, 5000)
 
     def on_yolo_mode_changed(self, text):
         if self.camera_worker:
@@ -739,12 +757,8 @@ class MainWindow(QMainWindow):
 
     def capture_frame(self):
         # if camera running, use latest frame
-        if self.camera_worker and getattr(self.camera_worker, 'latest_frame', None) is not None:
+        if self.camera_worker and self.camera_worker.latest_frame is not None:
             frame = self.camera_worker.latest_frame.copy()
-            worker = SingleYOLOWorker(self.camera_worker.model, frame)
-            worker.image_update.connect(self.update_camera_feed)
-            worker.detections_update.connect(self.update_detections)
-            worker.start()
         else:
             # grab one frame with temporary capture
             cap = cv2.VideoCapture(0)
@@ -753,10 +767,10 @@ class MainWindow(QMainWindow):
             if not ret:
                 QMessageBox.warning(self, "Capture Failed", "Could not capture frame from camera.")
                 return
-            worker = SingleYOLOWorker(YOLO(YOLO_MODEL), frame)
-            worker.image_update.connect(self.update_camera_feed)
-            worker.detections_update.connect(self.update_detections)
-            worker.start()
+        worker = SingleYOLOWorker(self.yolo_model, frame)
+        worker.image_update.connect(self.update_camera_feed)
+        worker.detections_update.connect(self.update_detections)
+        self._start_bg_worker(worker)
 
     def update_camera_feed(self, image):
         self.camera_label.setPixmap(QPixmap.fromImage(image).scaled(
@@ -810,54 +824,60 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Assistant personality set: {mode}")
 
     def add_document(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Document", "", 
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Document", "",
                                                    "Documents (*.pdf *.txt *.md *.csv)")
-        if file_path:
-            # Copy to documents folder for persistence
-            filename = os.path.basename(file_path)
-            dest_path = os.path.join("documents", filename)
-            
-            # If checking file existence, etc.
-            try:
-                if not os.path.exists(dest_path):
-                    shutil.copy2(file_path, dest_path)
-                
-                # Ingest
-                self.chat_display.append(f"<i>System: Adding {filename}... please wait.</i>")
-                success = add_file_to_db(dest_path)
-                if success:
-                    self.chat_display.append(f"<i>System: Added {filename} successfully.</i>")
-                else:
-                    self.chat_display.append(f"<i>System: Failed to add {filename}. Check console.</i>")
-            except Exception as e:
-                self.chat_display.append(f"<i>System: Error: {e}</i>")
+        if not file_path:
+            return
+        # Copy to documents folder for persistence (overwrites an older file with the same name)
+        filename = os.path.basename(file_path)
+        dest_path = os.path.join(DOCUMENTS_PATH, filename)
+        try:
+            os.makedirs(DOCUMENTS_PATH, exist_ok=True)
+            if os.path.abspath(file_path) != os.path.abspath(dest_path):
+                shutil.copy2(file_path, dest_path)
+        except Exception as e:
+            self.append_system_message(f"Error copying {filename}: {e}")
+            return
+
+        self.append_system_message(f"Adding {filename}... please wait.")
+        worker = IngestWorker(dest_path)
+        worker.ingest_finished.connect(self.on_ingest_finished)
+        self._start_bg_worker(worker)
+
+    def on_ingest_finished(self, filename, success):
+        if success:
+            self.append_system_message(f"Added {filename} successfully.")
+        else:
+            self.append_system_message(f"Failed to add {filename}. Check console.")
+
+    def append_system_message(self, text):
+        self.chat_display.append(f"<i>System: {html.escape(text)}</i>")
 
     def start_new_session(self):
         self.session_id = str(uuid.uuid4())
         self.chat_display.clear()
-        self.chat_display.append("<i>System: New session started.</i>")
+        self.append_system_message("New session started.")
+
+    def _update_thinking_status(self):
+        if self.pending_requests > 0:
+            self.statusBar().showMessage(f"Assistant is thinking... ({self.pending_requests} pending)")
+        else:
+            self.statusBar().clearMessage()
 
     def send_message(self):
         text = self.input_field.text().strip()
         if not text:
             return
-        
-        # Display user message
-        self.chat_display.append(f"<b>You:</b> {text}")
+
+        self.chat_display.append(f"<b>You:</b> {html.escape(text)}")
         self.input_field.clear()
-        
-        # Determine visual context
+
         vis_context = self.latest_visual_context
-        
-        # Save user message to DB
-        # Note: We save document_context as "PENDING" or empty for user msg, 
-        # but it's really associated with the assistant response.
         database_manager.save_message(self.session_id, "user", text, vis_context)
-        
-        # Signal loading
-        self.chat_display.append("<i>Assistant is thinking...</i>")
-        
-        # Run worker (include selected personality text)
+
+        self.pending_requests += 1
+        self._update_thinking_status()
+
         self.llm_worker.generate(
             text,
             vis_context,
@@ -868,42 +888,43 @@ class MainWindow(QMainWindow):
         )
 
     def handle_llm_response(self, response, doc_context, visual_context, session_id):
-        # Remove "thinking" line approximately (simplification)
-        # Better: just append response.
-        
-        self.chat_display.append(f"<b>Assistant:</b> {response}")
-        self.chat_display.append("<hr>")
-        
-        # Save to DB
+        self.pending_requests = max(0, self.pending_requests - 1)
+        self._update_thinking_status()
+
+        # Save to DB (also for answers that belong to a session the user already left)
         database_manager.save_message(session_id, "assistant", response, visual_context, doc_context)
 
+        if session_id != self.session_id:
+            return
+
+        self.chat_display.append(f"<b>Assistant:</b> {html.escape(response).replace(chr(10), '<br>')}")
+        self.chat_display.append("<hr>")
+
         # Optionally speak the response using the long-running TTS manager
-        if getattr(self, 'speak_responses', False):
+        if self.speak_responses:
             try:
                 self.tts_manager.speak(
                     response,
                     voice_id=(self.tts_voice_id or None),
                     rate=(self.tts_rate or None),
-                    volume=(self.tts_volume if hasattr(self, 'tts_volume') else None)
+                    volume=self.tts_volume
                 )
             except Exception as e:
                 print(f"Failed to enqueue TTS: {e}")
-def close_all_tts_workers(workers):
-    # wait briefly for each worker to finish, then delete
-    for w in list(workers):
-        try:
-            if w.isRunning():
-                w.wait(2000)
-        except Exception:
-            pass
+
+    def closeEvent(self, event):
+        # Release camera and stop background threads before the window closes
+        if self.camera_worker:
+            self.camera_worker.stop()
+            self.camera_worker = None
+        self.llm_worker.stop()
+        for worker in list(self._bg_workers):
+            worker.wait(2000)
+        super().closeEvent(event)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    try:
-        ret = app.exec()
-    finally:
-        # ensure background TTS workers are finished before exit
-        close_all_tts_workers(window._tts_workers)
-    sys.exit(ret)
+    sys.exit(app.exec())

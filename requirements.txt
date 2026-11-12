@@ -1,14 +1,19 @@
-speechrecognition
-pyttsx3
-opencv-python
-ultralytics
-huggingface-hub
-llama-cpp-python
-pyaudio
-Cython
-pybind11
-nemo_toolkit[asr]
-langchain
+# GUI
+PyQt6
+
+# LLM + RAG (Ollama must be installed and running: https://ollama.com)
+langchain-core
 langchain-ollama
 langchain-chroma
-pandas
+langchain-community
+langchain-text-splitters
+pypdf
+
+# Vision
+opencv-python
+ultralytics
+
+# Audio (TTS output, microphone tools)
+pyttsx3
+pyaudio
+SpeechRecognition

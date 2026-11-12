@@ -1,47 +1,58 @@
-# Voice Assistant Setup
+# AI Assistant mit Vision & RAG
 
-## Prerequisites
-- Windows 10/11
-- NVIDIA GPU (RTX 3060Ti or similar) with drivers installed
-- Python 3.10 or 3.11 recommended
+Lokaler KI-Assistent mit Desktop-GUI (PyQt6):
+
+- **Chat** mit einem lokalen LLM über [Ollama](https://ollama.com)
+- **Dokumente (RAG):** PDF, TXT, MD und CSV werden indexiert und als Kontext genutzt (Chroma + `bge-m3` Embeddings)
+- **Vision:** Webcam mit YOLOv8-Objekterkennung; was die Kamera sieht, fließt in die Antwort ein
+- **Sprachausgabe (TTS)** über `pyttsx3`, Stimme/Tempo/Lautstärke einstellbar
+- **Chatverlauf** wird in einer lokalen SQLite-Datenbank (`chat_history.db`) gespeichert
+
+## Voraussetzungen
+
+- Windows 10/11 (Linux funktioniert grundsätzlich ebenfalls)
+- Python 3.10 oder 3.11
+- NVIDIA-GPU empfohlen (z. B. RTX 3060 Ti)
+- [Ollama](https://ollama.com/download) installiert und gestartet
 
 ## Installation
 
-1. **Install dependencies:**
-   It is recommended to install `llama-cpp-python` separately first to ensure CUDA (GPU) support.
-   
-   If you have CUDA 12.x installed:
-   ```bash
-   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
-   ```
-   (Or check https://github.com/abetlen/llama-cpp-python for the wheel matching your CUDA version).
-
-   Then install the rest:
+1. **Python-Pakete installieren:**
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **Download the LLM:**
-   Run the download script to fetch the Llama-3 model (approx 4.6GB).
+2. **Modelle in Ollama laden:**
    ```bash
-   python download_model.py
+   ollama pull mirage335/Llama-3_1-8B-Instruct-abliterated-virtuoso
+   ollama pull bge-m3
    ```
+   Das YOLO-Modell (`yolov8n.pt`) lädt `ultralytics` beim ersten Kamerastart automatisch herunter.
 
-## Usage
+## Starten
 
-1. **Audio Setup:**
-   - Connect your Bose NC 700 HP.
-   - Set it as the **Default Playback Device** in Windows Sound settings (for TTS output).
-   - The script will automatically try to find it for **Microphone Input**.
+```bash
+python gui_app.py
+```
 
-2. **Run the Assistant:**
-   ```bash
-   python voice_assistant.py
-   ```
+Weitere Einstiegspunkte:
 
-## Controls
-- Speak clearly into the microphone.
-- Say "stop system" to exit.
-- The assistant will see what is on "Cam One" and include it in its response.
-- YOLO Mode: You can choose "Stream" (continuous inference with throttling and downscale) or "Single" (capture one frame for detection using the "Capture Frame" button).
-- The LLM is pre-warmed on startup to reduce the first-query delay. TTS uses a persistent engine to avoid repeated initialization overhead.
+| Datei | Zweck |
+|---|---|
+| `gui_app.py` | Haupt-Anwendung (GUI) |
+| `main.py` | Einfacher Konsolen-Chat mit den Dokumenten (RAG) |
+| `check_audio_devices.py` | Listet Audio-Geräte (hilfreich für die Mikrofon-Auswahl) |
+| `legacy/voice_assistant.py` | Alter Konsolen-Sprachassistent (llama-cpp + Google-Spracherkennung). Wird durch die Spracheingabe in der GUI ersetzt. |
+
+## Bedienung
+
+- **Options → Add Document:** Dokument hinzufügen. Es wird nach `documents/` kopiert und im Hintergrund indexiert. Erneutes Hinzufügen derselben Datei ersetzt den alten Stand.
+- Dateien, die direkt in den Ordner `documents/` gelegt werden, werden beim nächsten Start automatisch indexiert. Zum kompletten Neuaufbau den Ordner `chrome_langchain_db/` löschen.
+- **Options → Assistant Settings:** Persönlichkeit/System-Prompt, Dokumente und Kamera-Kontext an- und abschalten.
+- **Options → Voice Settings / Speak Responses:** Sprachausgabe konfigurieren.
+- **Kamera:** Modus „Stream“ (laufende Erkennung, gedrosselt) oder „Single“ (Erkennung nur per „Capture Frame“).
+- Nachrichten können auch geschickt werden, während das Modell noch lädt oder antwortet. Sie werden der Reihe nach abgearbeitet. Das LLM wird beim Start vorgeladen, um die erste Antwort zu beschleunigen.
+
+## Lokale Daten
+
+`models/`, `documents/`, `chrome_langchain_db/`, `chat_history.db` und `*.pt` sind in `.gitignore` eingetragen und werden nicht eingecheckt.
