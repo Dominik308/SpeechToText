@@ -13,7 +13,8 @@ pypdf
 opencv-python
 ultralytics
 
-# Audio (TTS output, microphone tools)
-pyttsx3
+# Speech input (local speech recognition) and output
+faster-whisper
+numpy
 pyaudio
-SpeechRecognition
+pyttsx3

@@ -11,9 +11,10 @@ from collections import Counter
 import cv2
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, QSplitter,
-                             QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, QDialogButtonBox, QCheckBox)
+                             QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, QDialogButtonBox, QCheckBox,
+                             QProgressBar)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
-from PyQt6.QtGui import QImage, QPixmap, QAction
+from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QShortcut
 
 # NOTE: We avoid importing main.py directly because it has a blocking loop.
 # The LLM logic is replicated in LLMWorker.
@@ -21,6 +22,7 @@ from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 from vector import retriever, add_file_to_db, DOCUMENTS_PATH
 import database_manager
+import speech_input
 from ultralytics import YOLO
 
 # Constants
@@ -174,6 +176,47 @@ class IngestWorker(QThread):
     def run(self):
         ok = add_file_to_db(self.file_path)
         self.ingest_finished.emit(os.path.basename(self.file_path), ok)
+
+
+class SpeechWorker(QThread):
+    """Records one utterance from the microphone and transcribes it locally."""
+    level_changed = pyqtSignal(float)
+    state_changed = pyqtSignal(str)   # 'recording' or 'transcribing'
+    text_ready = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, transcriber, device_index=None, language=None, auto_stop=True):
+        super().__init__()
+        self.transcriber = transcriber
+        self.device_index = device_index
+        self.language = language
+        self.auto_stop = auto_stop
+        self._stop_requested = False
+
+    def stop_recording(self):
+        self._stop_requested = True
+
+    def run(self):
+        # Load the Whisper model while the user is speaking
+        threading.Thread(target=self._preload, daemon=True).start()
+        try:
+            self.state_changed.emit('recording')
+            audio = speech_input.record(
+                should_stop=lambda: self._stop_requested,
+                on_level=self.level_changed.emit,
+                device_index=self.device_index,
+                auto_stop=self.auto_stop,
+            )
+            self.state_changed.emit('transcribing')
+            self.text_ready.emit(self.transcriber.transcribe(audio, language=self.language))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def _preload(self):
+        try:
+            self.transcriber.load()
+        except Exception as e:
+            print(f"Whisper preload failed: {e}")
 
 
 class CameraWorker(QThread):
@@ -550,6 +593,88 @@ class AssistantSettingsDialog(QDialog):
                 bool(self.use_docs_cb.isChecked()),
                 bool(self.use_visual_cb.isChecked()))
 
+class SpeechSettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Speech Input Settings')
+        self.setModal(True)
+        form = QFormLayout(self)
+
+        self.mic_cb = QComboBox()
+        self.mic_cb.addItem('System Default', '')
+        try:
+            for _idx, name in speech_input.list_input_devices():
+                self.mic_cb.addItem(name, name)
+        except Exception as e:
+            self.mic_cb.addItem(f'(could not list devices: {e})', '')
+
+        self.model_cb = QComboBox()
+        self.model_cb.addItems(speech_input.MODEL_SIZES)
+        self.language_cb = QComboBox()
+        self.language_cb.addItems(list(speech_input.LANGUAGES))
+        self.device_cb = QComboBox()
+        self.device_cb.addItem('Auto (GPU if available)', 'auto')
+        self.device_cb.addItem('GPU (CUDA)', 'cuda')
+        self.device_cb.addItem('CPU', 'cpu')
+        self.auto_stop_cb = QCheckBox('Stop recording automatically after a pause')
+        self.auto_send_cb = QCheckBox('Send recognized text immediately')
+
+        hint = QLabel('Larger models are more accurate but slower. '
+                      'They are downloaded automatically on first use.')
+        hint.setWordWrap(True)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        form.addRow('Microphone', self.mic_cb)
+        form.addRow('Whisper Model', self.model_cb)
+        form.addRow('Language', self.language_cb)
+        form.addRow('Compute Device', self.device_cb)
+        form.addRow('', self.auto_stop_cb)
+        form.addRow('', self.auto_send_cb)
+        form.addRow('', hint)
+        form.addRow('', buttons)
+
+        cfg = load_speech_settings()
+        idx = self.mic_cb.findData(cfg['mic_name'])
+        self.mic_cb.setCurrentIndex(idx if idx >= 0 else 0)
+        self.model_cb.setCurrentText(cfg['model_size'])
+        self.language_cb.setCurrentText(cfg['language'])
+        idx = self.device_cb.findData(cfg['compute_device'])
+        self.device_cb.setCurrentIndex(idx if idx >= 0 else 0)
+        self.auto_stop_cb.setChecked(cfg['auto_stop'])
+        self.auto_send_cb.setChecked(cfg['auto_send'])
+
+    def get_values(self):
+        return {
+            'mic_name': self.mic_cb.currentData() or '',
+            'model_size': self.model_cb.currentText(),
+            'language': self.language_cb.currentText(),
+            'compute_device': self.device_cb.currentData() or 'auto',
+            'auto_stop': self.auto_stop_cb.isChecked(),
+            'auto_send': self.auto_send_cb.isChecked(),
+        }
+
+
+def load_speech_settings():
+    settings = QSettings('YourOrg', 'SpeechToText')
+    return {
+        'mic_name': settings.value('stt/mic_name', ''),
+        'model_size': settings.value('stt/model_size', speech_input.DEFAULT_MODEL_SIZE),
+        'language': settings.value('stt/language', 'Auto'),
+        'compute_device': settings.value('stt/compute_device', 'auto'),
+        'auto_stop': settings.value('stt/auto_stop', True, type=bool),
+        'auto_send': settings.value('stt/auto_send', True, type=bool),
+    }
+
+
+def save_speech_settings(values):
+    settings = QSettings('YourOrg', 'SpeechToText')
+    for key, value in values.items():
+        settings.setValue(f'stt/{key}', value)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -586,6 +711,10 @@ class MainWindow(QMainWindow):
         # TTS control
         self.speak_responses = True
         self.tts_manager = TTSManager()
+
+        # Speech input (STT)
+        self.speech_worker = None
+        self._transcriber = None
 
         # Load persisted TTS settings
         settings = QSettings('YourOrg', 'SpeechToText')
@@ -631,6 +760,10 @@ class MainWindow(QMainWindow):
         assistant_settings_action.triggered.connect(self.open_assistant_settings)
         file_menu.addAction(assistant_settings_action)
 
+        speech_settings_action = QAction('Speech Input Settings', self)
+        speech_settings_action.triggered.connect(self.open_speech_settings)
+        file_menu.addAction(speech_settings_action)
+
 
         # Main Layout
         central_widget = QWidget()
@@ -655,8 +788,21 @@ class MainWindow(QMainWindow):
         
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send_message)
-        
+
+        self.mic_btn = QPushButton("Speak")
+        self.mic_btn.setToolTip("Speak your message (Ctrl+Space)")
+        self.mic_btn.clicked.connect(self.toggle_recording)
+        QShortcut(QKeySequence("Ctrl+Space"), self, activated=self.toggle_recording)
+
+        self.mic_level = QProgressBar()
+        self.mic_level.setRange(0, 100)
+        self.mic_level.setTextVisible(False)
+        self.mic_level.setFixedWidth(80)
+        self.mic_level.setVisible(False)
+
         input_layout.addWidget(self.input_field)
+        input_layout.addWidget(self.mic_level)
+        input_layout.addWidget(self.mic_btn)
         input_layout.addWidget(self.send_btn)
         chat_layout.addLayout(input_layout)
 
@@ -823,6 +969,101 @@ class MainWindow(QMainWindow):
             self.personality_text = _personality_text_from_mode(mode, custom)
             self.statusBar().showMessage(f"Assistant personality set: {mode}")
 
+    # ------------------------------------------------------------------ speech input
+
+    def open_speech_settings(self):
+        dialog = SpeechSettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            values = dialog.get_values()
+            save_speech_settings(values)
+            self.statusBar().showMessage(
+                f"Speech input: {values['model_size']} model, language {values['language']}", 5000)
+
+    def _get_transcriber(self, cfg):
+        """Reuse the loaded Whisper model unless model or device changed."""
+        t = self._transcriber
+        if t is None or t.model_size != cfg['model_size'] or t.device != cfg['compute_device']:
+            self._transcriber = speech_input.Transcriber(cfg['model_size'], cfg['compute_device'])
+        return self._transcriber
+
+    @staticmethod
+    def _resolve_mic_index(mic_name):
+        if not mic_name:
+            return None
+        try:
+            for idx, name in speech_input.list_input_devices():
+                if name == mic_name:
+                    return idx
+        except Exception as e:
+            print(f"Could not list audio devices: {e}")
+        print(f"Microphone '{mic_name}' not found, using system default.")
+        return None
+
+    def toggle_recording(self):
+        if self.speech_worker is not None:
+            # Second press while recording: stop and transcribe
+            self.speech_worker.stop_recording()
+            return
+
+        cfg = load_speech_settings()
+        self.speech_worker = SpeechWorker(
+            self._get_transcriber(cfg),
+            device_index=self._resolve_mic_index(cfg['mic_name']),
+            language=speech_input.LANGUAGES.get(cfg['language']),
+            auto_stop=cfg['auto_stop'],
+        )
+        self._speech_auto_send = cfg['auto_send']
+        self.speech_worker.level_changed.connect(self.on_mic_level)
+        self.speech_worker.state_changed.connect(self.on_speech_state)
+        self.speech_worker.text_ready.connect(self.on_speech_text)
+        self.speech_worker.failed.connect(self.on_speech_failed)
+        self.speech_worker.finished.connect(self.on_speech_finished)
+        self.speech_worker.start()
+
+    def on_mic_level(self, level):
+        # RMS of speech is roughly 0.01-0.3; show it on a log-like scale
+        self.mic_level.setValue(min(100, int((level ** 0.5) * 180)))
+
+    def on_speech_state(self, state):
+        if state == 'recording':
+            self.mic_btn.setText("Stop")
+            self.mic_level.setValue(0)
+            self.mic_level.setVisible(True)
+            self.statusBar().showMessage("Listening... (press Stop or Ctrl+Space when done)")
+        elif state == 'transcribing':
+            self.mic_btn.setText("...")
+            self.mic_btn.setEnabled(False)
+            self.mic_level.setVisible(False)
+            self.statusBar().showMessage("Transcribing...")
+
+    def on_speech_text(self, text):
+        self.statusBar().clearMessage()
+        if not text:
+            self.statusBar().showMessage("No speech recognized.", 4000)
+            return
+        current = self.input_field.text().strip()
+        self.input_field.setText(f"{current} {text}".strip())
+        if self._speech_auto_send:
+            self.send_message()
+        else:
+            self.input_field.setFocus()
+
+    def on_speech_failed(self, message):
+        self.statusBar().clearMessage()
+        QMessageBox.warning(self, "Speech Input", f"Speech input failed:\n{message}")
+
+    def on_speech_finished(self):
+        if self.speech_worker is not None:
+            self.speech_worker.deleteLater()
+        self.speech_worker = None
+        self.mic_btn.setText("Speak")
+        self.mic_btn.setEnabled(True)
+        self.mic_level.setVisible(False)
+        if self.pending_requests:
+            self._update_thinking_status()
+
+    # ------------------------------------------------------------------ documents
+
     def add_document(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Document", "",
                                                    "Documents (*.pdf *.txt *.md *.csv)")
@@ -917,6 +1158,9 @@ class MainWindow(QMainWindow):
         if self.camera_worker:
             self.camera_worker.stop()
             self.camera_worker = None
+        if self.speech_worker is not None:
+            self.speech_worker.stop_recording()
+            self.speech_worker.wait(5000)
         self.llm_worker.stop()
         for worker in list(self._bg_workers):
             worker.wait(2000)
