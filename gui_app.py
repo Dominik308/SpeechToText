@@ -12,22 +12,26 @@ import cv2
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, QSplitter,
                              QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, QDialogButtonBox, QCheckBox,
-                             QProgressBar)
+                             QProgressBar, QListWidget, QListWidgetItem, QMenu, QSpinBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
-from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QShortcut
+from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QShortcut, QTextCursor, QTextCharFormat, QTextBlockFormat
 
 # NOTE: We avoid importing main.py directly because it has a blocking loop.
 # The LLM logic is replicated in LLMWorker.
-from langchain_ollama.llms import OllamaLLM
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from vector import retriever, add_file_to_db, DOCUMENTS_PATH
 import database_manager
 import speech_input
+from text_utils import SentenceBuffer, clean_for_speech
 from ultralytics import YOLO
 
 # Constants
 MODEL_NAME = "mirage335/Llama-3_1-8B-Instruct-abliterated-virtuoso"
 YOLO_MODEL = "yolov8n.pt"
+DEFAULT_MAX_TOKENS = 400
+DEFAULT_MEMORY_TURNS = 6
 
 
 def describe_detections(model, results):
@@ -58,43 +62,54 @@ class LLMWorker(QThread):
     """
     Long-running background thread for LLM inference.
 
-    Requests are queued, so a message sent while the model is still loading or
-    answering a previous question is processed afterwards instead of being lost.
+    - Requests are queued, so a message sent while the model is still loading or
+      answering a previous question is processed afterwards instead of being lost.
+    - The answer is streamed chunk by chunk (response_chunk) and finally saved to
+      the database and reported via response_done.
+    - The previous messages of the session are passed to the model as conversation memory.
     """
-    response_ready = pyqtSignal(str, str, str, str)  # response, context_text, visual_context, session_id
+    response_chunk = pyqtSignal(int, str, str)        # request_id, session_id, text chunk
+    response_done = pyqtSignal(int, str, str, bool)   # request_id, session_id, full text, ok
 
-    PROMPT_TEMPLATE = """
-{personality}
+    SYSTEM_TEMPLATE = """{personality}
+Answer in the language of the user's question.
 
 Visual Context (what the camera sees): {visual_context}
 
-Document Context: {context}
+Document Context: {context}"""
 
-Question: {question}
-"""
-
-    def __init__(self, model_name, temperature=None, num_predict=None):
+    def __init__(self, model_name, temperature=0.2, num_predict=DEFAULT_MAX_TOKENS,
+                 memory_turns=DEFAULT_MEMORY_TURNS):
         super().__init__()
         self.model_name = model_name
+        # These may be changed from the GUI at any time; they apply to the next request.
         self.temperature = temperature
         self.num_predict = num_predict
+        self.memory_turns = memory_turns
         self.chain = None
+        self._chain_params = None
         self._init_error = ""
         self._requests = queue.Queue()
+        self._next_request_id = 0
+
+    def _build_chain(self):
+        params = (float(self.temperature), int(self.num_predict))
+        if self.chain is not None and params == self._chain_params:
+            return
+        print(f"Initializing LLM (temperature={params[0]}, num_predict={params[1]})...")
+        # num_predict is Ollama's name for the maximum number of generated tokens
+        llm = ChatOllama(model=self.model_name, temperature=params[0], num_predict=params[1])
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", self.SYSTEM_TEMPLATE),
+            MessagesPlaceholder("history"),
+            ("human", "{question}"),
+        ])
+        self.chain = prompt | llm
+        self._chain_params = params
 
     def _init_llm(self):
         try:
-            t0 = time.perf_counter()
-            llm_kwargs = {}
-            if self.temperature is not None:
-                llm_kwargs['temperature'] = float(self.temperature)
-            if self.num_predict is not None:
-                # Ollama's name for the maximum number of generated tokens
-                llm_kwargs['num_predict'] = int(self.num_predict)
-            print(f"Initializing LLM with params: {llm_kwargs}...")
-            llm = OllamaLLM(model=self.model_name, **llm_kwargs)
-            self.chain = ChatPromptTemplate.from_template(self.PROMPT_TEMPLATE) | llm
-            print(f"LLM initialized in {time.perf_counter()-t0:.2f}s")
+            self._build_chain()
         except Exception as e:
             self._init_error = str(e)
             print(f"Error initializing LLM: {e}")
@@ -118,10 +133,23 @@ Question: {question}
                 break
             self._process(request)
 
+    def _load_history(self, session_id, message_id):
+        if self.memory_turns <= 0 or message_id is None:
+            return []
+        try:
+            rows = database_manager.get_context_history(
+                session_id, message_id, max_messages=2 * int(self.memory_turns))
+        except Exception as e:
+            print(f"Could not load conversation history: {e}")
+            return []
+        return [HumanMessage(content) if role == 'user' else AIMessage(content) for role, content in rows]
+
     def _process(self, req):
-        session_id = req['session_id']
-        if self.chain is None:
-            self.response_ready.emit(f"Error initializing LLM: {self._init_error}", "", "", session_id)
+        rid, session_id = req['request_id'], req['session_id']
+        try:
+            self._build_chain()
+        except Exception as e:
+            self.response_done.emit(rid, session_id, f"Error initializing LLM: {e}", False)
             return
         try:
             context_text = ""
@@ -135,30 +163,50 @@ Question: {question}
                     print(f"Retriever error (continuing without documents): {e}")
 
             visual_context = req['visual_context'] if req['use_visual'] else ""
+            history = self._load_history(session_id, req['message_id'])
 
             t1 = time.perf_counter()
-            result = self.chain.invoke({
+            parts = []
+            for chunk in self.chain.stream({
                 "context": context_text,
                 "question": req['question'],
                 "visual_context": visual_context,
                 "personality": req['personality'],
-            })
-            print(f"LLM inference took {time.perf_counter()-t1:.2f}s")
-            self.response_ready.emit(result, context_text, visual_context, session_id)
-        except Exception as e:
-            self.response_ready.emit(f"Error during inference: {e}", "", "", session_id)
+                "history": history,
+            }):
+                text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if text:
+                    parts.append(text)
+                    self.response_chunk.emit(rid, session_id, text)
+            answer = "".join(parts).strip()
+            print(f"LLM answered in {time.perf_counter()-t1:.2f}s "
+                  f"({len(history)} history messages)")
 
-    def generate(self, question, visual_context, session_id, personality: str = "", use_docs: bool = True, use_visual: bool = True):
+            # Save here (not in the GUI) so the next queued request already sees this answer
+            database_manager.save_message(session_id, "assistant", answer, visual_context, context_text,
+                                          reply_to=req['message_id'])
+            self.response_done.emit(rid, session_id, answer, True)
+        except Exception as e:
+            self.response_done.emit(rid, session_id, f"Error during inference: {e}", False)
+
+    def generate(self, question, visual_context, session_id, message_id=None, personality: str = "",
+                 use_docs: bool = True, use_visual: bool = True):
+        """Queue a question. `message_id` is the database id of the stored user message.
+        Returns the request id used in the response signals."""
+        self._next_request_id += 1
         self._requests.put({
+            'request_id': self._next_request_id,
             'question': question,
             'visual_context': visual_context,
             'session_id': session_id,
+            'message_id': message_id,
             'personality': personality,
             'use_docs': bool(use_docs),
             'use_visual': bool(use_visual),
         })
         if not self.isRunning():
             self.start()
+        return self._next_request_id
 
     def stop(self, timeout_ms=5000):
         self._requests.put(None)
@@ -372,6 +420,14 @@ class TTSManager:
     def speak(self, text, voice_id=None, rate=None, volume=None):
         self._q.put((text, voice_id, rate, volume))
 
+    def clear(self):
+        """Drop everything that is still waiting to be spoken."""
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+
 
 def _enumerate_pyttsx3_voices() -> list:
     """Return list of voice dicts: {'id','name','languages'}"""
@@ -560,6 +616,15 @@ class AssistantSettingsDialog(QDialog):
         self.use_docs_cb = QCheckBox('Include Documents (RAG)')
         self.use_visual_cb = QCheckBox('Include Visual Context')
 
+        self.memory_spin = QSpinBox()
+        self.memory_spin.setRange(0, 30)
+        self.memory_spin.setSuffix(' exchanges')
+        self.memory_spin.setToolTip('How many previous question/answer pairs the assistant remembers (0 = none)')
+        self.max_tokens_spin = QSpinBox()
+        self.max_tokens_spin.setRange(50, 4096)
+        self.max_tokens_spin.setSingleStep(50)
+        self.max_tokens_spin.setSuffix(' tokens')
+
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
@@ -568,6 +633,8 @@ class AssistantSettingsDialog(QDialog):
         form.addRow('Custom Prompt', self.custom_edit)
         form.addRow('', self.use_docs_cb)
         form.addRow('', self.use_visual_cb)
+        form.addRow('Conversation Memory', self.memory_spin)
+        form.addRow('Max Answer Length', self.max_tokens_spin)
         form.addRow('', self.buttons)
 
         # Load settings
@@ -580,6 +647,8 @@ class AssistantSettingsDialog(QDialog):
         self.custom_edit.setPlainText(custom)
         self.use_docs_cb.setChecked(use_docs)
         self.use_visual_cb.setChecked(use_visual)
+        self.memory_spin.setValue(int(settings.value('assistant/memory_turns', DEFAULT_MEMORY_TURNS)))
+        self.max_tokens_spin.setValue(int(settings.value('assistant/max_tokens', DEFAULT_MAX_TOKENS)))
 
         # Show/hide custom field
         def on_mode_change(text):
@@ -591,7 +660,9 @@ class AssistantSettingsDialog(QDialog):
         return (self.mode_cb.currentText(),
                 self.custom_edit.toPlainText(),
                 bool(self.use_docs_cb.isChecked()),
-                bool(self.use_visual_cb.isChecked()))
+                bool(self.use_visual_cb.isChecked()),
+                self.memory_spin.value(),
+                self.max_tokens_spin.value())
 
 class SpeechSettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -696,10 +767,14 @@ class MainWindow(QMainWindow):
         self.llm_worker = LLMWorker(
             MODEL_NAME,
             temperature=float(settings.value('assistant/temperature', 0.2)),
-            num_predict=int(settings.value('assistant/max_tokens', 150)),
+            num_predict=int(settings.value('assistant/max_tokens', DEFAULT_MAX_TOKENS)),
+            memory_turns=int(settings.value('assistant/memory_turns', DEFAULT_MEMORY_TURNS)),
         )
-        self.llm_worker.response_ready.connect(self.handle_llm_response)
+        self.llm_worker.response_chunk.connect(self.on_response_chunk)
+        self.llm_worker.response_done.connect(self.on_response_done)
         self.pending_requests = 0
+        # Answer currently being streamed into the chat: {'rid', 'cursor', 'sentences'}
+        self._stream = None
         # Pre-warm LLM to avoid first-query delay
         QTimer.singleShot(1000, self.llm_worker.start)
 
@@ -732,6 +807,8 @@ class MainWindow(QMainWindow):
         self.use_visual = settings.value('assistant/use_visual', True, type=bool)
         # compute actual personality text
         self.personality_text = _personality_text_from_mode(self.assistant_personality_mode, self.assistant_custom_personality)
+
+        self.refresh_session_list()
 
     def setup_ui(self):
         # Menu Bar
@@ -770,8 +847,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        # Splitter to resize Chat vs Vision
+        # Splitter to resize Sessions vs Chat vs Vision
         splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # --- Far left: Sessions ---
+        sessions_widget = QWidget()
+        sessions_layout = QVBoxLayout(sessions_widget)
+        sessions_layout.setContentsMargins(0, 0, 0, 0)
+        new_session_btn = QPushButton("New Session")
+        new_session_btn.clicked.connect(self.start_new_session)
+        self.session_list = QListWidget()
+        self.session_list.setWordWrap(True)
+        self.session_list.setStyleSheet("QListWidget::item { padding: 6px 4px; border-bottom: 1px solid palette(midlight); }")
+        self.session_list.itemClicked.connect(self.on_session_clicked)
+        self.session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.session_list.customContextMenuRequested.connect(self.on_session_context_menu)
+        sessions_layout.addWidget(new_session_btn)
+        sessions_layout.addWidget(self.session_list)
 
         # --- Left Side: Chat ---
         chat_widget = QWidget()
@@ -842,10 +934,13 @@ class MainWindow(QMainWindow):
         vision_layout.addStretch()
 
         # Add to splitter
+        splitter.addWidget(sessions_widget)
         splitter.addWidget(chat_widget)
         splitter.addWidget(vision_widget)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
+        splitter.setSizes([220, 600, 380])
 
         main_layout.addWidget(splitter)
 
@@ -956,12 +1051,16 @@ class MainWindow(QMainWindow):
     def open_assistant_settings(self):
         dialog = AssistantSettingsDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            mode, custom, use_docs, use_visual = dialog.get_values()
+            mode, custom, use_docs, use_visual, memory_turns, max_tokens = dialog.get_values()
             settings = QSettings('YourOrg', 'SpeechToText')
             settings.setValue('assistant/personality_mode', mode)
             settings.setValue('assistant/custom_personality', custom)
             settings.setValue('assistant/use_docs', use_docs)
             settings.setValue('assistant/use_visual', use_visual)
+            settings.setValue('assistant/memory_turns', memory_turns)
+            settings.setValue('assistant/max_tokens', max_tokens)
+            self.llm_worker.memory_turns = memory_turns
+            self.llm_worker.num_predict = max_tokens
             self.assistant_personality_mode = mode
             self.assistant_custom_personality = custom
             self.use_docs = bool(use_docs)
@@ -1005,6 +1104,8 @@ class MainWindow(QMainWindow):
             self.speech_worker.stop_recording()
             return
 
+        # Don't let queued speech output talk over the user
+        self.tts_manager.clear()
         cfg = load_speech_settings()
         self.speech_worker = SpeechWorker(
             self._get_transcriber(cfg),
@@ -1094,10 +1195,98 @@ class MainWindow(QMainWindow):
     def append_system_message(self, text):
         self.chat_display.append(f"<i>System: {html.escape(text)}</i>")
 
+    # ------------------------------------------------------------------ sessions
+
+    def refresh_session_list(self):
+        try:
+            sessions = database_manager.get_all_sessions()
+        except Exception as e:
+            print(f"Could not load sessions: {e}")
+            return
+        self.session_list.blockSignals(True)
+        self.session_list.clear()
+        for session_id, start_time, title in sessions:
+            title = (title or "(no messages)").strip().replace("\n", " ")
+            if len(title) > 60:
+                title = title[:57] + "..."
+            date = str(start_time or "")[:16]
+            item = QListWidgetItem(f"{title}\n{date}")
+            item.setData(Qt.ItemDataRole.UserRole, session_id)
+            item.setToolTip(title)
+            self.session_list.addItem(item)
+            if session_id == self.session_id:
+                item.setSelected(True)
+                self.session_list.setCurrentItem(item)
+        self.session_list.blockSignals(False)
+
+    def _reset_chat_view(self):
+        self.tts_manager.clear()
+        self._stream = None
+        self.chat_display.clear()
+
     def start_new_session(self):
         self.session_id = str(uuid.uuid4())
-        self.chat_display.clear()
+        self._reset_chat_view()
         self.append_system_message("New session started.")
+        self.session_list.clearSelection()
+
+    def on_session_clicked(self, item):
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        if session_id != self.session_id:
+            self.load_session(session_id)
+
+    def load_session(self, session_id):
+        self.session_id = session_id
+        self._reset_chat_view()
+        for role, content in database_manager.get_session_history(session_id):
+            if role == 'user':
+                self.append_user_message(content)
+            else:
+                self.append_assistant_message(content)
+        self.refresh_session_list()
+
+    def on_session_context_menu(self, pos):
+        item = self.session_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete Session")
+        if menu.exec(self.session_list.mapToGlobal(pos)) == delete_action:
+            session_id = item.data(Qt.ItemDataRole.UserRole)
+            answer = QMessageBox.question(self, "Delete Session",
+                                          "Delete this conversation permanently?")
+            if answer == QMessageBox.StandardButton.Yes:
+                database_manager.delete_session(session_id)
+                if session_id == self.session_id:
+                    self.start_new_session()
+                self.refresh_session_list()
+
+    # ------------------------------------------------------------------ chat
+
+    def _scroll_chat_to_bottom(self):
+        bar = self.chat_display.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def append_user_message(self, text):
+        self.chat_display.append(f"<b>You:</b> {html.escape(text)}")
+        self._scroll_chat_to_bottom()
+
+    def append_assistant_message(self, text, error=False):
+        if error:
+            body = html.escape(text).replace("\n", "<br>")
+            self.chat_display.append(f"<b>Assistant:</b> <span style='color:#c0392b'>{body}</span>")
+        else:
+            self.chat_display.append("<b>Assistant:</b>")
+            cursor = QTextCursor(self.chat_display.document())
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
+            self._insert_markdown(cursor, text)
+        self._scroll_chat_to_bottom()
+
+    @staticmethod
+    def _insert_markdown(cursor, text):
+        # Keep single line breaks of the model's answer (Markdown would join the lines)
+        cursor.insertMarkdown(text.replace("\n", "  \n"))
 
     def _update_thinking_status(self):
         if self.pending_requests > 0:
@@ -1110,11 +1299,14 @@ class MainWindow(QMainWindow):
         if not text:
             return
 
-        self.chat_display.append(f"<b>You:</b> {html.escape(text)}")
+        self.append_user_message(text)
         self.input_field.clear()
 
         vis_context = self.latest_visual_context
-        database_manager.save_message(self.session_id, "user", text, vis_context)
+        is_new_session = not database_manager.get_session_history(self.session_id)
+        message_id = database_manager.save_message(self.session_id, "user", text, vis_context)
+        if is_new_session:
+            self.refresh_session_list()
 
         self.pending_requests += 1
         self._update_thinking_status()
@@ -1123,35 +1315,72 @@ class MainWindow(QMainWindow):
             text,
             vis_context,
             self.session_id,
+            message_id=message_id,
             personality=self.personality_text,
             use_docs=self.use_docs,
             use_visual=self.use_visual
         )
 
-    def handle_llm_response(self, response, doc_context, visual_context, session_id):
+    def _speak(self, text):
+        text = clean_for_speech(text)
+        if not (self.speak_responses and text):
+            return
+        try:
+            self.tts_manager.speak(
+                text,
+                voice_id=(self.tts_voice_id or None),
+                rate=(self.tts_rate or None),
+                volume=self.tts_volume
+            )
+        except Exception as e:
+            print(f"Failed to enqueue TTS: {e}")
+
+    def on_response_chunk(self, request_id, session_id, text):
+        if session_id != self.session_id:
+            return  # answer for a session that is not shown
+        if self._stream is None or self._stream['rid'] != request_id:
+            # First chunk: open a new "Assistant:" paragraph and keep a cursor to it.
+            # The cursor stays inside this paragraph even if the user sends another
+            # message meanwhile (which is appended below it).
+            self.chat_display.append("<b>Assistant:</b>")
+            cursor = QTextCursor(self.chat_display.document())
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
+            self._stream = {'rid': request_id, 'cursor': cursor, 'start': cursor.position(),
+                            'sentences': SentenceBuffer()}
+            text = text.lstrip()
+        bar = self.chat_display.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
+        self._stream['cursor'].insertText(text, QTextCharFormat())
+        if at_bottom:
+            self._scroll_chat_to_bottom()
+        for sentence in self._stream['sentences'].feed(text):
+            self._speak(sentence)
+
+    def on_response_done(self, request_id, session_id, text, ok):
         self.pending_requests = max(0, self.pending_requests - 1)
         self._update_thinking_status()
-
-        # Save to DB (also for answers that belong to a session the user already left)
-        database_manager.save_message(session_id, "assistant", response, visual_context, doc_context)
+        self.refresh_session_list()
 
         if session_id != self.session_id:
             return
-
-        self.chat_display.append(f"<b>Assistant:</b> {html.escape(response).replace(chr(10), '<br>')}")
-        self.chat_display.append("<hr>")
-
-        # Optionally speak the response using the long-running TTS manager
-        if self.speak_responses:
-            try:
-                self.tts_manager.speak(
-                    response,
-                    voice_id=(self.tts_voice_id or None),
-                    rate=(self.tts_rate or None),
-                    volume=self.tts_volume
-                )
-            except Exception as e:
-                print(f"Failed to enqueue TTS: {e}")
+        stream = self._stream if self._stream and self._stream['rid'] == request_id else None
+        self._stream = None
+        if not ok:
+            # Error: show it (below a partial answer, if any); errors are not spoken or saved
+            self.append_assistant_message(text, error=True)
+        elif stream is None:
+            # Nothing was streamed (e.g. empty answer): show the full text at once
+            self.append_assistant_message(text)
+            self._speak(text)
+        else:
+            # Replace the streamed plain text with the rendered Markdown version
+            cursor = QTextCursor(self.chat_display.document())
+            cursor.setPosition(stream['start'])
+            cursor.setPosition(stream['cursor'].position(), QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            self._insert_markdown(cursor, text)
+            self._speak(stream['sentences'].flush())
 
     def closeEvent(self, event):
         # Release camera and stop background threads before the window closes
