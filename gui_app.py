@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, QSplitter,
                              QMessageBox, QDialog, QComboBox, QSlider, QFormLayout, QDialogButtonBox, QCheckBox,
                              QProgressBar, QListWidget, QListWidgetItem, QMenu, QSpinBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QShortcut, QTextCursor, QTextCharFormat, QTextBlockFormat
 
 # NOTE: We avoid importing main.py directly because it has a blocking loop.
@@ -24,7 +24,9 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from vector import retriever, add_file_to_db, DOCUMENTS_PATH
 import database_manager
 import speech_input
-from text_utils import SentenceBuffer, clean_for_speech
+from text_utils import SentenceBuffer, prepare_for_speech
+import tts_engine
+from vision_labels_de import label_de
 from ultralytics import YOLO
 
 # Constants
@@ -32,16 +34,25 @@ MODEL_NAME = "mirage335/Llama-3_1-8B-Instruct-abliterated-virtuoso"
 YOLO_MODEL = "yolov8n.pt"
 DEFAULT_MAX_TOKENS = 400
 DEFAULT_MEMORY_TURNS = 6
+CAMERA_OFF_CONTEXT = "Kamera ist aus"
+
+# Answer language of the assistant
+ANSWER_LANGUAGES = [("de", "Immer Deutsch (empfohlen)"), ("auto", "In der Sprache der Frage")]
+LANGUAGE_INSTRUCTIONS = {
+    "de": ("Antworte immer auf Deutsch – in natürlichem, korrektem und gut verständlichem Deutsch, "
+           "auch wenn Dokumente oder Kamera-Informationen englisch sind."),
+    "auto": "Antworte in der Sprache, in der die Frage gestellt wurde.",
+}
 
 
 def describe_detections(model, results):
-    """Turn YOLO results into a short text like '2 person, 1 cup'."""
+    """Turn YOLO results into a short German text like '2× Person, 1× Tasse'."""
     labels = []
     for result in results:
         for box in result.boxes:
-            labels.append(model.names[int(box.cls[0])])
+            labels.append(label_de(model.names[int(box.cls[0])]))
     counts = Counter(labels)
-    return ", ".join(f"{count} {obj}" for obj, count in counts.items()) or "nothing of note"
+    return ", ".join(f"{count}× {obj}" for obj, count in counts.items()) or "nichts Besonderes"
 
 
 def frame_to_qimage(frame):
@@ -72,11 +83,13 @@ class LLMWorker(QThread):
     response_done = pyqtSignal(int, str, str, bool)   # request_id, session_id, full text, ok
 
     SYSTEM_TEMPLATE = """{personality}
-Answer in the language of the user's question.
+{language_instruction}
+Deine Antworten werden oft vorgelesen: Formuliere klar, in ganzen Sätzen und ohne Tabellen.
 
-Visual Context (what the camera sees): {visual_context}
+Was die Kamera gerade sieht: {visual_context}
 
-Document Context: {context}"""
+Auszüge aus den Dokumenten des Nutzers (nur verwenden, wenn sie zur Frage passen):
+{context}"""
 
     def __init__(self, model_name, temperature=0.2, num_predict=DEFAULT_MAX_TOKENS,
                  memory_turns=DEFAULT_MEMORY_TURNS):
@@ -93,12 +106,12 @@ Document Context: {context}"""
         self._next_request_id = 0
 
     def _build_chain(self):
-        params = (float(self.temperature), int(self.num_predict))
+        params = (self.model_name, float(self.temperature), int(self.num_predict))
         if self.chain is not None and params == self._chain_params:
             return
-        print(f"Initializing LLM (temperature={params[0]}, num_predict={params[1]})...")
+        print(f"Initializing LLM {params[0]} (temperature={params[1]}, num_predict={params[2]})...")
         # num_predict is Ollama's name for the maximum number of generated tokens
-        llm = ChatOllama(model=self.model_name, temperature=params[0], num_predict=params[1])
+        llm = ChatOllama(model=params[0], temperature=params[1], num_predict=params[2])
         prompt = ChatPromptTemplate.from_messages([
             ("system", self.SYSTEM_TEMPLATE),
             MessagesPlaceholder("history"),
@@ -149,7 +162,7 @@ Document Context: {context}"""
         try:
             self._build_chain()
         except Exception as e:
-            self.response_done.emit(rid, session_id, f"Error initializing LLM: {e}", False)
+            self.response_done.emit(rid, session_id, f"Fehler beim Starten des Sprachmodells: {e}", False)
             return
         try:
             context_text = ""
@@ -162,7 +175,7 @@ Document Context: {context}"""
                 except Exception as e:
                     print(f"Retriever error (continuing without documents): {e}")
 
-            visual_context = req['visual_context'] if req['use_visual'] else ""
+            visual_context = req['visual_context'] if req['use_visual'] else "(Kamera nicht berücksichtigt)"
             history = self._load_history(session_id, req['message_id'])
 
             t1 = time.perf_counter()
@@ -172,6 +185,8 @@ Document Context: {context}"""
                 "question": req['question'],
                 "visual_context": visual_context,
                 "personality": req['personality'],
+                "language_instruction": LANGUAGE_INSTRUCTIONS.get(req['answer_language'],
+                                                                  LANGUAGE_INSTRUCTIONS['de']),
                 "history": history,
             }):
                 text = chunk.content if hasattr(chunk, 'content') else str(chunk)
@@ -187,10 +202,10 @@ Document Context: {context}"""
                                           reply_to=req['message_id'])
             self.response_done.emit(rid, session_id, answer, True)
         except Exception as e:
-            self.response_done.emit(rid, session_id, f"Error during inference: {e}", False)
+            self.response_done.emit(rid, session_id, f"Fehler bei der Antwort des Sprachmodells: {e}", False)
 
     def generate(self, question, visual_context, session_id, message_id=None, personality: str = "",
-                 use_docs: bool = True, use_visual: bool = True):
+                 use_docs: bool = True, use_visual: bool = True, answer_language: str = "de"):
         """Queue a question. `message_id` is the database id of the stored user message.
         Returns the request id used in the response signals."""
         self._next_request_id += 1
@@ -203,6 +218,7 @@ Document Context: {context}"""
             'personality': personality,
             'use_docs': bool(use_docs),
             'use_visual': bool(use_visual),
+            'answer_language': answer_language,
         })
         if not self.isRunning():
             self.start()
@@ -288,7 +304,7 @@ class CameraWorker(QThread):
     def run(self):
         self.cap = cv2.VideoCapture(0)  # Default camera
         if not self.cap.isOpened():
-            self.camera_error.emit("Could not open camera.")
+            self.camera_error.emit("Kamera konnte nicht geöffnet werden.")
             self.cap.release()
             return
 
@@ -299,7 +315,7 @@ class CameraWorker(QThread):
             if not ret:
                 failed_reads += 1
                 if failed_reads > 100:
-                    self.camera_error.emit("Camera stopped delivering frames.")
+                    self.camera_error.emit("Die Kamera liefert keine Bilder mehr.")
                     break
                 time.sleep(0.02)
                 continue
@@ -344,364 +360,294 @@ class SingleYOLOWorker(QThread):
             print("SingleYOLOWorker error:", e)
 
 
-class TTSWorker(QThread):
-    """Background worker to speak text using pyttsx3 with voice/rate/volume support."""
-    def __init__(self, text: str, voice_id: str = None, rate: int = None, volume: float = None):
-        super().__init__()
-        self.text = text
-        self.voice_id = voice_id
-        self.rate = rate
-        self.volume = volume
-
-    def run(self):
-        try:
-            import pyttsx3
-            tts = pyttsx3.init()
-            if self.voice_id:
-                try:
-                    tts.setProperty('voice', self.voice_id)
-                except Exception:
-                    pass
-            if self.rate is not None:
-                try:
-                    tts.setProperty('rate', int(self.rate))
-                except Exception:
-                    pass
-            if self.volume is not None:
-                try:
-                    tts.setProperty('volume', float(self.volume))
-                except Exception:
-                    pass
-            tts.say(self.text)
-            tts.runAndWait()
-        except Exception as e:
-            print(f"TTSWorker error: {e}")
+class StatusBridge(QObject):
+    """Forwards status messages from background threads to the GUI thread."""
+    message = pyqtSignal(str)
 
 
-class TTSManager:
-    """Single long-running pyttsx3 engine with queue to avoid re-initialization cost."""
-    def __init__(self):
-        self._q = queue.Queue()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._engine = None
-        self._thread.start()
-
-    def _get_engine(self):
-        if self._engine is None:
-            import pyttsx3
-            self._engine = pyttsx3.init()
-        return self._engine
-
-    def _run(self):
-        while True:
-            text, voice_id, rate, volume = self._q.get()
-            try:
-                engine = self._get_engine()
-                if voice_id:
-                    try:
-                        engine.setProperty('voice', voice_id)
-                    except Exception:
-                        pass
-                if rate is not None:
-                    try:
-                        engine.setProperty('rate', int(rate))
-                    except Exception:
-                        pass
-                if volume is not None:
-                    try:
-                        engine.setProperty('volume', float(volume))
-                    except Exception:
-                        pass
-                engine.say(text)
-                engine.runAndWait()
-            except Exception as e:
-                print("TTSManager error:", e)
-
-    def speak(self, text, voice_id=None, rate=None, volume=None):
-        self._q.put((text, voice_id, rate, volume))
-
-    def clear(self):
-        """Drop everything that is still waiting to be spoken."""
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
+def load_tts_settings():
+    settings = QSettings('YourOrg', 'SpeechToText')
+    return tts_engine.TTSSettings(
+        engine=settings.value('tts/engine', tts_engine.ENGINE_PIPER),
+        piper_voice=settings.value('tts/piper_voice', tts_engine.DEFAULT_VOICE),
+        system_voice_id=settings.value('tts/voice_id', ''),
+        speed=int(settings.value('tts/speed', 100)) / 100.0,
+        volume=int(settings.value('tts/volume', 80)) / 100.0,
+    )
 
 
-def _enumerate_pyttsx3_voices() -> list:
-    """Return list of voice dicts: {'id','name','languages'}"""
-    results = []
-    try:
-        import pyttsx3
-        engine = pyttsx3.init()
-        voices = engine.getProperty('voices') or []
-        for v in voices:
-            vid = getattr(v, 'id', '') or ''
-            name = getattr(v, 'name', '') or vid
-            langs = []
-            try:
-                raw = getattr(v, 'languages', []) or []
-                for l in raw:
-                    try:
-                        if isinstance(l, bytes):
-                            langs.append(l.decode('utf-8', errors='ignore'))
-                        else:
-                            langs.append(str(l))
-                    except Exception:
-                        langs.append(str(l))
-            except Exception:
-                pass
-            results.append({'id': str(vid), 'name': str(name), 'languages': langs})
-    except Exception as e:
-        print(f"Failed to enumerate pyttsx3 voices: {e}")
-    return results
+def save_tts_settings(tts):
+    settings = QSettings('YourOrg', 'SpeechToText')
+    settings.setValue('tts/engine', tts.engine)
+    settings.setValue('tts/piper_voice', tts.piper_voice)
+    settings.setValue('tts/voice_id', tts.system_voice_id)
+    settings.setValue('tts/speed', int(round(tts.speed * 100)))
+    settings.setValue('tts/volume', int(round(tts.volume * 100)))
+
 
 class VoiceSettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    TEST_TEXT = ("Hallo! So klinge ich. Bei ca. 21 °C ist es z. B. ideal für einen Spaziergang, "
+                 "und am 3. Oktober ist Feiertag.")
+
+    def __init__(self, speech_output, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Voice Settings')
+        self.setWindowTitle('Sprachausgabe')
         self.setModal(True)
+        self.speech_output = speech_output
+        form = QFormLayout(self)
 
-        self.form = QFormLayout(self)
+        self.engine_cb = QComboBox()
+        self.engine_cb.addItem('Piper – natürliche deutsche Stimme (empfohlen)', tts_engine.ENGINE_PIPER)
+        self.engine_cb.addItem('System-Stimme (Windows)', tts_engine.ENGINE_SYSTEM)
 
-        self.lang_cb = QComboBox()
-        self.lang_cb.addItems(['Any', 'English', 'German'])
+        self.piper_cb = QComboBox()
+        for key, label in tts_engine.GERMAN_VOICES:
+            self.piper_cb.addItem(label, key)
 
-        self.gender_cb = QComboBox()
-        self.gender_cb.addItems(['Any', 'Female', 'Male'])
+        self.system_cb = QComboBox()
+        for vid, name, is_german in tts_engine.list_system_voices():
+            self.system_cb.addItem(f"{name} (Deutsch)" if is_german else name, vid)
+        if self.system_cb.count() == 0:
+            self.system_cb.addItem('(keine System-Stimmen gefunden)', '')
 
-        self.voice_cb = QComboBox()
-
-        self.rate_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rate_slider.setRange(80, 300)
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(50, 200)
+        self.speed_label = QLabel()
+        self.speed_slider.valueChanged.connect(lambda v: self.speed_label.setText(f"{v} %"))
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(self.speed_slider)
+        speed_row.addWidget(self.speed_label)
 
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setRange(0, 100)
 
-        self.test_btn = QPushButton('Test Voice')
-        self.test_btn.clicked.connect(self.on_test)
+        test_btn = QPushButton('Stimme testen')
+        test_btn.clicked.connect(self.on_test)
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
+        hint = QLabel('Die Piper-Stimme läuft lokal und wird beim ersten Benutzen einmalig heruntergeladen. '
+                      'Mit Esc lässt sich das Vorlesen jederzeit abbrechen.')
+        hint.setWordWrap(True)
 
-        self.form.addRow('Language', self.lang_cb)
-        self.form.addRow('Gender', self.gender_cb)
-        self.form.addRow('Voice', self.voice_cb)
-        self.form.addRow('Rate', self.rate_slider)
-        self.form.addRow('Volume', self.volume_slider)
-        self.form.addRow('', self.test_btn)
-        self.form.addRow('', self.buttons)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('Abbrechen')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
 
-        # Enumerate voices first to avoid signals firing before list exists
-        self.available_voices = _enumerate_pyttsx3_voices()
+        form.addRow('Sprachausgabe', self.engine_cb)
+        form.addRow('Piper-Stimme', self.piper_cb)
+        form.addRow('System-Stimme', self.system_cb)
+        form.addRow('Tempo', speed_row)
+        form.addRow('Lautstärke', self.volume_slider)
+        form.addRow('', test_btn)
+        form.addRow('', hint)
+        form.addRow('', buttons)
 
-        # Connect signals after enumeration
-        self.lang_cb.currentTextChanged.connect(self.update_voice_list)
-        self.gender_cb.currentTextChanged.connect(self.update_voice_list)
+        current = load_tts_settings()
+        self._select(self.engine_cb, current.engine)
+        self._select(self.piper_cb, current.piper_voice)
+        self._select(self.system_cb, current.system_voice_id)
+        self.speed_slider.setValue(int(round(current.speed * 100)))
+        self.speed_label.setText(f"{self.speed_slider.value()} %")
+        self.volume_slider.setValue(int(round(current.volume * 100)))
 
-        # Load saved settings
-        settings = QSettings('YourOrg', 'SpeechToText')
-        lang = settings.value('tts/language', 'Any')
-        gender = settings.value('tts/gender', 'Any')
-        voice_id = settings.value('tts/voice_id', '')
-        rate = int(settings.value('tts/rate', 180))
-        volume = int(settings.value('tts/volume', 80))
+        self.engine_cb.currentIndexChanged.connect(self._update_visibility)
+        self._update_visibility()
 
-        self.lang_cb.setCurrentText(lang)
-        self.gender_cb.setCurrentText(gender)
-        self.rate_slider.setValue(rate)
-        self.volume_slider.setValue(volume)
+    @staticmethod
+    def _select(combo, data):
+        idx = combo.findData(data)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
 
-        self.update_voice_list()
+    def _update_visibility(self):
+        piper = self.engine_cb.currentData() == tts_engine.ENGINE_PIPER
+        self.piper_cb.setEnabled(piper)
+        self.system_cb.setEnabled(not piper)
 
-        if voice_id:
-            idx = self.voice_cb.findData(voice_id)
-            if idx >= 0:
-                self.voice_cb.setCurrentIndex(idx)
-
-        # Track live test workers so they are not destroyed while running
-        self._test_workers = []
-
-    def update_voice_list(self):
-        language = self.lang_cb.currentText()
-        gender = self.gender_cb.currentText()
-        filtered = []
-
-        # safeguard if enumeration failed earlier
-        if not getattr(self, 'available_voices', None):
-            self.available_voices = _enumerate_pyttsx3_voices()
-
-        for v in self.available_voices:
-            name_low = v['name'].lower()
-            langs_low = ' '.join(v['languages']).lower()
-            vid_low = str(v.get('id', '')).lower()
-
-            lang_ok = True
-            if language == 'English':
-                lang_ok = ('en' in langs_low) or ('english' in name_low) or ('en' in vid_low)
-            elif language == 'German':
-                lang_ok = ('de' in langs_low) or ('german' in name_low) or ('de' in vid_low)
-
-            gender_ok = True
-            if gender == 'Female':
-                gender_ok = ('female' in name_low) or ('frau' in name_low) or any(f in name_low for f in ['anna', 'sara', 'sarah', 'julia', 'maria']) or ('f' in vid_low and 'male' not in vid_low)
-            elif gender == 'Male':
-                # Enhanced heuristics: check for 'male', common male names, or voice ids that include 'm' markers
-                gender_ok = ('male' in name_low) or any(m in name_low for m in ['john', 'david', 'michael', 'peter', 'mark', 'david', 'paul', 'tom', 'thomas']) or (' m' in vid_low) or (vid_low.endswith('m')) or ('-m' in vid_low)
-
-            if lang_ok and gender_ok:
-                filtered.append(v)
-
-        # If no voices matched the filters, show all and keep user informed
-        if not filtered:
-            filtered = self.available_voices
-
-        self.voice_cb.clear()
-        for v in filtered:
-            display = v['name']
-            # Append language hint
-            if v['languages']:
-                display = f"{display} ({', '.join(v['languages'])})"
-            self.voice_cb.addItem(display, v['id'])
+    def get_settings(self):
+        return tts_engine.TTSSettings(
+            engine=self.engine_cb.currentData(),
+            piper_voice=self.piper_cb.currentData(),
+            system_voice_id=self.system_cb.currentData() or '',
+            speed=self.speed_slider.value() / 100.0,
+            volume=self.volume_slider.value() / 100.0,
+        )
 
     def on_test(self):
-        text = "This is a test of the selected voice."
-        vid = self.voice_cb.currentData()
-        rate = self.rate_slider.value()
-        volume = self.volume_slider.value() / 100.0
-        worker = TTSWorker(text, voice_id=vid, rate=rate, volume=volume)
-        # keep a reference to prevent QThread 'destroyed while running' warnings
-        self._test_workers.append(worker)
+        self.speech_output.stop()
+        self.speech_output.speak(prepare_for_speech(self.TEST_TEXT), settings=self.get_settings())
 
-        def _on_finished():
-            try:
-                self._test_workers.remove(worker)
-            except Exception:
-                pass
-            try:
-                worker.deleteLater()
-            except Exception:
-                pass
 
-        worker.finished.connect(_on_finished)
-        worker.start()
+# (key, label) – the key is stored in the settings
+PERSONALITY_MODES = [
+    ('Default', 'Standard'),
+    ('Friendly', 'Freundlich (du)'),
+    ('Professional', 'Professionell (Sie)'),
+    ('Custom', 'Eigener Prompt'),
+    ('Off', 'Aus'),
+]
+
 
 def _personality_text_from_mode(mode: str, custom_text: str) -> str:
     if not mode or mode == 'Off':
         return ''
     if mode == 'Default':
-        return 'You are a helpful assistant. Use the provided context to answer the user\'s question.'
+        return ('Du bist ein hilfsbereiter, persönlicher Assistent. Beantworte die Fragen des Nutzers '
+                'genau und verständlich und nutze dabei den bereitgestellten Kontext.')
     if mode == 'Friendly':
-        return 'You are a friendly, conversational assistant. Be brief, positive, and helpful.'
+        return ('Du bist ein freundlicher, lockerer Assistent und duzt den Nutzer. '
+                'Antworte kurz, positiv und hilfsbereit.')
     if mode == 'Professional':
-        return 'You are a professional assistant. Use formal tone and concise, accurate answers.'
+        return ('Du bist ein professioneller Assistent und siezt den Nutzer. '
+                'Antworte sachlich, höflich, präzise und knapp.')
     if mode == 'Custom':
         return custom_text or ''
     return ''
 
+
+def list_ollama_models():
+    """Names of the models installed in Ollama (empty if Ollama is not reachable)."""
+    try:
+        import ollama
+        response = ollama.list()
+        models = getattr(response, 'models', None)
+        if models is None:
+            models = response.get('models', [])
+        names = []
+        for m in models:
+            name = getattr(m, 'model', None) or (m.get('model') or m.get('name') if isinstance(m, dict) else None)
+            if name:
+                names.append(name)
+        return sorted(names)
+    except Exception as e:
+        print(f"Could not list Ollama models: {e}")
+        return []
+
+
 class AssistantSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Assistant Settings')
+        self.setWindowTitle('Assistent')
         self.setModal(True)
 
         form = QFormLayout(self)
-        self.mode_cb = QComboBox()
-        self.mode_cb.addItems(['Default', 'Friendly', 'Professional', 'Custom', 'Off'])
-        self.custom_edit = QTextEdit()
-        self.custom_edit.setPlaceholderText('Enter custom system prompt here...')
+        self.form = form
 
-        self.use_docs_cb = QCheckBox('Include Documents (RAG)')
-        self.use_visual_cb = QCheckBox('Include Visual Context')
+        self.model_cb = QComboBox()
+        self.model_cb.setEditable(True)
+        self.model_cb.addItems(list_ollama_models())
+        self.model_cb.setToolTip('Ollama-Modell. Für bestes Deutsch ein Modell mit starker Deutsch-Unterstützung wählen.')
+
+        self.language_cb = QComboBox()
+        for key, label in ANSWER_LANGUAGES:
+            self.language_cb.addItem(label, key)
+
+        self.mode_cb = QComboBox()
+        for key, label in PERSONALITY_MODES:
+            self.mode_cb.addItem(label, key)
+        self.custom_edit = QTextEdit()
+        self.custom_edit.setPlaceholderText('Eigenen System-Prompt hier eingeben …')
+
+        self.use_docs_cb = QCheckBox('Dokumente einbeziehen (RAG)')
+        self.use_visual_cb = QCheckBox('Kamerabild einbeziehen')
 
         self.memory_spin = QSpinBox()
         self.memory_spin.setRange(0, 30)
-        self.memory_spin.setSuffix(' exchanges')
-        self.memory_spin.setToolTip('How many previous question/answer pairs the assistant remembers (0 = none)')
+        self.memory_spin.setSuffix(' Wechsel')
+        self.memory_spin.setToolTip('Wie viele vorherige Frage/Antwort-Paare der Assistent kennt (0 = kein Gedächtnis)')
         self.max_tokens_spin = QSpinBox()
         self.max_tokens_spin.setRange(50, 4096)
         self.max_tokens_spin.setSingleStep(50)
-        self.max_tokens_spin.setSuffix(' tokens')
+        self.max_tokens_spin.setSuffix(' Tokens')
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('Abbrechen')
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
 
-        form.addRow('Personality Mode', self.mode_cb)
-        form.addRow('Custom Prompt', self.custom_edit)
+        form.addRow('Sprachmodell', self.model_cb)
+        form.addRow('Antwortsprache', self.language_cb)
+        form.addRow('Persönlichkeit', self.mode_cb)
+        form.addRow('Eigener Prompt', self.custom_edit)
         form.addRow('', self.use_docs_cb)
         form.addRow('', self.use_visual_cb)
-        form.addRow('Conversation Memory', self.memory_spin)
-        form.addRow('Max Answer Length', self.max_tokens_spin)
+        form.addRow('Gesprächsgedächtnis', self.memory_spin)
+        form.addRow('Max. Antwortlänge', self.max_tokens_spin)
         form.addRow('', self.buttons)
 
         # Load settings
         settings = QSettings('YourOrg', 'SpeechToText')
-        mode = settings.value('assistant/personality_mode', 'Default')
-        custom = settings.value('assistant/custom_personality', '')
-        use_docs = settings.value('assistant/use_docs', True, type=bool)
-        use_visual = settings.value('assistant/use_visual', True, type=bool)
-        self.mode_cb.setCurrentText(mode)
-        self.custom_edit.setPlainText(custom)
-        self.use_docs_cb.setChecked(use_docs)
-        self.use_visual_cb.setChecked(use_visual)
+        self.model_cb.setCurrentText(settings.value('assistant/model', MODEL_NAME))
+        idx = self.language_cb.findData(settings.value('assistant/answer_language', 'de'))
+        self.language_cb.setCurrentIndex(max(0, idx))
+        idx = self.mode_cb.findData(settings.value('assistant/personality_mode', 'Default'))
+        self.mode_cb.setCurrentIndex(max(0, idx))
+        self.custom_edit.setPlainText(settings.value('assistant/custom_personality', ''))
+        self.use_docs_cb.setChecked(settings.value('assistant/use_docs', True, type=bool))
+        self.use_visual_cb.setChecked(settings.value('assistant/use_visual', True, type=bool))
         self.memory_spin.setValue(int(settings.value('assistant/memory_turns', DEFAULT_MEMORY_TURNS)))
         self.max_tokens_spin.setValue(int(settings.value('assistant/max_tokens', DEFAULT_MAX_TOKENS)))
 
         # Show/hide custom field
-        def on_mode_change(text):
-            self.custom_edit.setVisible(text == 'Custom')
-        on_mode_change(self.mode_cb.currentText())
-        self.mode_cb.currentTextChanged.connect(on_mode_change)
+        def on_mode_change(_index=None):
+            # hides the field together with its label
+            self.form.setRowVisible(self.custom_edit, self.mode_cb.currentData() == 'Custom')
+        on_mode_change()
+        self.mode_cb.currentIndexChanged.connect(on_mode_change)
 
     def get_values(self):
-        return (self.mode_cb.currentText(),
-                self.custom_edit.toPlainText(),
-                bool(self.use_docs_cb.isChecked()),
-                bool(self.use_visual_cb.isChecked()),
-                self.memory_spin.value(),
-                self.max_tokens_spin.value())
+        return {
+            'model': self.model_cb.currentText().strip() or MODEL_NAME,
+            'answer_language': self.language_cb.currentData(),
+            'personality_mode': self.mode_cb.currentData(),
+            'custom_personality': self.custom_edit.toPlainText(),
+            'use_docs': bool(self.use_docs_cb.isChecked()),
+            'use_visual': bool(self.use_visual_cb.isChecked()),
+            'memory_turns': self.memory_spin.value(),
+            'max_tokens': self.max_tokens_spin.value(),
+        }
+
 
 class SpeechSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Speech Input Settings')
+        self.setWindowTitle('Spracheingabe')
         self.setModal(True)
         form = QFormLayout(self)
 
         self.mic_cb = QComboBox()
-        self.mic_cb.addItem('System Default', '')
+        self.mic_cb.addItem('Standard-Mikrofon des Systems', '')
         try:
             for _idx, name in speech_input.list_input_devices():
                 self.mic_cb.addItem(name, name)
         except Exception as e:
-            self.mic_cb.addItem(f'(could not list devices: {e})', '')
+            self.mic_cb.addItem(f'(Geräte konnten nicht gelesen werden: {e})', '')
 
         self.model_cb = QComboBox()
-        self.model_cb.addItems(speech_input.MODEL_SIZES)
+        for key, label in speech_input.MODEL_SIZES:
+            self.model_cb.addItem(label, key)
         self.language_cb = QComboBox()
         self.language_cb.addItems(list(speech_input.LANGUAGES))
         self.device_cb = QComboBox()
-        self.device_cb.addItem('Auto (GPU if available)', 'auto')
+        self.device_cb.addItem('Automatisch (GPU, falls vorhanden)', 'auto')
         self.device_cb.addItem('GPU (CUDA)', 'cuda')
         self.device_cb.addItem('CPU', 'cpu')
-        self.auto_stop_cb = QCheckBox('Stop recording automatically after a pause')
-        self.auto_send_cb = QCheckBox('Send recognized text immediately')
+        self.auto_stop_cb = QCheckBox('Aufnahme nach einer Sprechpause automatisch beenden')
+        self.auto_send_cb = QCheckBox('Erkannten Text sofort senden')
 
-        hint = QLabel('Larger models are more accurate but slower. '
-                      'They are downloaded automatically on first use.')
+        hint = QLabel('Für Deutsch liefert „large-v3-turbo“ mit Sprache „Deutsch“ die beste Erkennung. '
+                      'Modelle werden beim ersten Benutzen einmalig heruntergeladen.')
         hint.setWordWrap(True)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('Abbrechen')
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        form.addRow('Microphone', self.mic_cb)
-        form.addRow('Whisper Model', self.model_cb)
-        form.addRow('Language', self.language_cb)
-        form.addRow('Compute Device', self.device_cb)
+        form.addRow('Mikrofon', self.mic_cb)
+        form.addRow('Whisper-Modell', self.model_cb)
+        form.addRow('Sprache', self.language_cb)
+        form.addRow('Rechnen auf', self.device_cb)
         form.addRow('', self.auto_stop_cb)
         form.addRow('', self.auto_send_cb)
         form.addRow('', hint)
@@ -710,7 +656,11 @@ class SpeechSettingsDialog(QDialog):
         cfg = load_speech_settings()
         idx = self.mic_cb.findData(cfg['mic_name'])
         self.mic_cb.setCurrentIndex(idx if idx >= 0 else 0)
-        self.model_cb.setCurrentText(cfg['model_size'])
+        idx = self.model_cb.findData(cfg['model_size'])
+        if idx < 0:  # model not in the list (e.g. set manually): keep it selectable
+            self.model_cb.addItem(cfg['model_size'], cfg['model_size'])
+            idx = self.model_cb.count() - 1
+        self.model_cb.setCurrentIndex(idx)
         self.language_cb.setCurrentText(cfg['language'])
         idx = self.device_cb.findData(cfg['compute_device'])
         self.device_cb.setCurrentIndex(idx if idx >= 0 else 0)
@@ -720,7 +670,7 @@ class SpeechSettingsDialog(QDialog):
     def get_values(self):
         return {
             'mic_name': self.mic_cb.currentData() or '',
-            'model_size': self.model_cb.currentText(),
+            'model_size': self.model_cb.currentData(),
             'language': self.language_cb.currentText(),
             'compute_device': self.device_cb.currentData() or 'auto',
             'auto_stop': self.auto_stop_cb.isChecked(),
@@ -733,11 +683,16 @@ def load_speech_settings():
     return {
         'mic_name': settings.value('stt/mic_name', ''),
         'model_size': settings.value('stt/model_size', speech_input.DEFAULT_MODEL_SIZE),
-        'language': settings.value('stt/language', 'Auto'),
+        'language': _speech_language(settings.value('stt/language', speech_input.DEFAULT_LANGUAGE)),
         'compute_device': settings.value('stt/compute_device', 'auto'),
         'auto_stop': settings.value('stt/auto_stop', True, type=bool),
         'auto_send': settings.value('stt/auto_send', True, type=bool),
     }
+
+
+def _speech_language(name):
+    name = speech_input.LEGACY_LANGUAGE_NAMES.get(name, name)
+    return name if name in speech_input.LANGUAGES else speech_input.DEFAULT_LANGUAGE
 
 
 def save_speech_settings(values):
@@ -746,10 +701,21 @@ def save_speech_settings(values):
         settings.setValue(f'stt/{key}', value)
 
 
+def _format_date(timestamp):
+    """'2026-11-13 09:05:12.123' -> '13.11.2026 09:05'"""
+    text = str(timestamp or "")
+    try:
+        date, time_ = text[:10], text[11:16]
+        y, m, d = date.split("-")
+        return f"{d}.{m}.{y} {time_}".strip()
+    except ValueError:
+        return text[:16]
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI Assistant with Vision & RAG")
+        self.setWindowTitle("KI-Assistent – Sprache, Kamera & Dokumente")
         self.setGeometry(100, 100, 1200, 800)
 
         # Database Init
@@ -757,7 +723,7 @@ class MainWindow(QMainWindow):
         
         # Session State
         self.session_id = str(uuid.uuid4())
-        self.latest_visual_context = "Camera not active"
+        self.latest_visual_context = CAMERA_OFF_CONTEXT
 
         # Setup UI
         self.setup_ui()
@@ -765,7 +731,7 @@ class MainWindow(QMainWindow):
         # Setup Workers
         settings = QSettings('YourOrg', 'SpeechToText')
         self.llm_worker = LLMWorker(
-            MODEL_NAME,
+            settings.value('assistant/model', MODEL_NAME),
             temperature=float(settings.value('assistant/temperature', 0.2)),
             num_predict=int(settings.value('assistant/max_tokens', DEFAULT_MAX_TOKENS)),
             memory_turns=int(settings.value('assistant/memory_turns', DEFAULT_MEMORY_TURNS)),
@@ -783,23 +749,20 @@ class MainWindow(QMainWindow):
         # Keep references to short-lived worker threads until they finish
         self._bg_workers = []
 
-        # TTS control
+        # Speech output (TTS)
         self.speak_responses = True
-        self.tts_manager = TTSManager()
+        self.status_bridge = StatusBridge()
+        self.status_bridge.message.connect(lambda msg: self.statusBar().showMessage(msg, 6000))
+        self.speech_output = tts_engine.SpeechOutput(load_tts_settings(), on_status=self.status_bridge.message.emit)
+        # Download/load the German voice in the background right away
+        self.speech_output.preload()
 
         # Speech input (STT)
         self.speech_worker = None
         self._transcriber = None
 
-        # Load persisted TTS settings
-        settings = QSettings('YourOrg', 'SpeechToText')
-        self.tts_language = settings.value('tts/language', 'Any')
-        self.tts_gender = settings.value('tts/gender', 'Any')
-        self.tts_voice_id = settings.value('tts/voice_id', '')
-        self.tts_rate = int(settings.value('tts/rate', 180))
-        self.tts_volume = float(settings.value('tts/volume', 80)) / 100.0
-
-        # Load assistant personality settings
+        # Load assistant settings
+        self.answer_language = settings.value('assistant/answer_language', 'de')
         self.assistant_personality_mode = settings.value('assistant/personality_mode', 'Default')
         self.assistant_custom_personality = settings.value('assistant/custom_personality', '')
         # Load whether to include documents/visual context
@@ -813,31 +776,37 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         # Menu Bar
         menubar = self.menuBar()
-        file_menu = menubar.addMenu('Options')
-        
-        add_doc_action = QAction('Add Document', self)
+        file_menu = menubar.addMenu('Optionen')
+
+        add_doc_action = QAction('Dokument hinzufügen …', self)
         add_doc_action.triggered.connect(self.add_document)
         file_menu.addAction(add_doc_action)
         
-        new_session_action = QAction('New Session', self)
+        new_session_action = QAction('Neues Gespräch', self)
         new_session_action.triggered.connect(self.start_new_session)
         file_menu.addAction(new_session_action)
 
         # Toggle whether assistant should speak responses
-        speak_action = QAction('Speak Responses', self, checkable=True)
+        speak_action = QAction('Antworten vorlesen', self, checkable=True)
         speak_action.setChecked(True)
-        speak_action.toggled.connect(lambda checked: setattr(self, 'speak_responses', checked))
+        speak_action.toggled.connect(self.on_speak_responses_toggled)
         file_menu.addAction(speak_action)
 
-        voice_settings_action = QAction('Voice Settings', self)
+        stop_speaking_action = QAction('Vorlesen abbrechen', self)
+        stop_speaking_action.setShortcut(QKeySequence("Esc"))
+        stop_speaking_action.triggered.connect(self.stop_speaking)
+        file_menu.addAction(stop_speaking_action)
+        file_menu.addSeparator()
+
+        voice_settings_action = QAction('Sprachausgabe …', self)
         voice_settings_action.triggered.connect(self.open_voice_settings)
         file_menu.addAction(voice_settings_action)
 
-        assistant_settings_action = QAction('Assistant Settings', self)
+        assistant_settings_action = QAction('Assistent …', self)
         assistant_settings_action.triggered.connect(self.open_assistant_settings)
         file_menu.addAction(assistant_settings_action)
 
-        speech_settings_action = QAction('Speech Input Settings', self)
+        speech_settings_action = QAction('Spracheingabe …', self)
         speech_settings_action.triggered.connect(self.open_speech_settings)
         file_menu.addAction(speech_settings_action)
 
@@ -854,11 +823,13 @@ class MainWindow(QMainWindow):
         sessions_widget = QWidget()
         sessions_layout = QVBoxLayout(sessions_widget)
         sessions_layout.setContentsMargins(0, 0, 0, 0)
-        new_session_btn = QPushButton("New Session")
+        new_session_btn = QPushButton("Neues Gespräch")
         new_session_btn.clicked.connect(self.start_new_session)
         self.session_list = QListWidget()
         self.session_list.setWordWrap(True)
-        self.session_list.setStyleSheet("QListWidget::item { padding: 6px 4px; border-bottom: 1px solid palette(midlight); }")
+        self.session_list.setStyleSheet(
+            "QListWidget::item { padding: 6px 4px; border-bottom: 1px solid palette(midlight); }"
+            "QListWidget::item:selected { background: palette(highlight); color: palette(highlighted-text); }")
         self.session_list.itemClicked.connect(self.on_session_clicked)
         self.session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.session_list.customContextMenuRequested.connect(self.on_session_context_menu)
@@ -875,14 +846,14 @@ class MainWindow(QMainWindow):
         
         input_layout = QHBoxLayout()
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Type your message here...")
+        self.input_field.setPlaceholderText("Nachricht eingeben oder Strg+Leertaste zum Sprechen …")
         self.input_field.returnPressed.connect(self.send_message)
         
-        self.send_btn = QPushButton("Send")
+        self.send_btn = QPushButton("Senden")
         self.send_btn.clicked.connect(self.send_message)
 
-        self.mic_btn = QPushButton("Speak")
-        self.mic_btn.setToolTip("Speak your message (Ctrl+Space)")
+        self.mic_btn = QPushButton("Sprechen")
+        self.mic_btn.setToolTip("Nachricht einsprechen (Strg+Leertaste)")
         self.mic_btn.clicked.connect(self.toggle_recording)
         QShortcut(QKeySequence("Ctrl+Space"), self, activated=self.toggle_recording)
 
@@ -902,24 +873,25 @@ class MainWindow(QMainWindow):
         vision_widget = QWidget()
         vision_layout = QVBoxLayout(vision_widget)
         
-        self.camera_label = QLabel("Camera Feed")
+        self.camera_label = QLabel("Kamerabild")
         self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.camera_label.setStyleSheet("background-color: black; color: white;")
         self.camera_label.setMinimumSize(400, 300)
         
-        self.vision_status = QLabel("Current Detection: None")
+        self.vision_status = QLabel("Erkannt: –")
         
         cam_controls = QHBoxLayout()
-        self.start_cam_btn = QPushButton("Start Camera")
+        self.start_cam_btn = QPushButton("Kamera starten")
         self.start_cam_btn.clicked.connect(self.start_camera)
-        self.stop_cam_btn = QPushButton("Stop Camera")
+        self.stop_cam_btn = QPushButton("Kamera stoppen")
         self.stop_cam_btn.clicked.connect(self.stop_camera)
         self.stop_cam_btn.setEnabled(False)
 
         self.yolo_mode_cb = QComboBox()
-        self.yolo_mode_cb.addItems(['Stream', 'Single'])
-        self.yolo_mode_cb.currentTextChanged.connect(self.on_yolo_mode_changed)
-        self.capture_btn = QPushButton("Capture Frame")
+        self.yolo_mode_cb.addItem('Live-Erkennung', 'stream')
+        self.yolo_mode_cb.addItem('Einzelbild', 'single')
+        self.yolo_mode_cb.currentIndexChanged.connect(self.on_yolo_mode_changed)
+        self.capture_btn = QPushButton("Bild analysieren")
         self.capture_btn.setEnabled(False)
         self.capture_btn.clicked.connect(self.capture_frame)
 
@@ -964,7 +936,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def start_camera(self):
-        mode = 'stream' if self.yolo_mode_cb.currentText() == 'Stream' else 'single'
+        mode = self.yolo_mode_cb.currentData()
         if self.camera_worker is None or not self.camera_worker.isRunning():
             self.camera_worker = CameraWorker(self.yolo_model, mode=mode)
             self.camera_worker.image_update.connect(self.update_camera_feed)
@@ -981,20 +953,21 @@ class MainWindow(QMainWindow):
             self.camera_worker = None
         self.start_cam_btn.setEnabled(True)
         self.stop_cam_btn.setEnabled(False)
-        self.capture_btn.setEnabled(self.yolo_mode_cb.currentText() == 'Single')
-        self.camera_label.setText("Camera Stopped")
-        self.latest_visual_context = "Camera not active"
-        self.vision_status.setText("Current Detection: None")
+        self.capture_btn.setEnabled(self.yolo_mode_cb.currentData() == 'single')
+        self.camera_label.setText("Kamera gestoppt")
+        self.latest_visual_context = CAMERA_OFF_CONTEXT
+        self.vision_status.setText("Erkannt: –")
 
     def on_camera_error(self, message):
         self.stop_camera()
         self.camera_label.setText(message)
         self.statusBar().showMessage(message, 5000)
 
-    def on_yolo_mode_changed(self, text):
+    def on_yolo_mode_changed(self, _index=None):
+        mode = self.yolo_mode_cb.currentData()
         if self.camera_worker:
-            self.camera_worker.mode = 'stream' if text == 'Stream' else 'single'
-        self.capture_btn.setEnabled(text == 'Single')
+            self.camera_worker.mode = mode
+        self.capture_btn.setEnabled(mode == 'single')
 
     def capture_frame(self):
         # if camera running, use latest frame
@@ -1006,7 +979,7 @@ class MainWindow(QMainWindow):
             ret, frame = cap.read()
             cap.release()
             if not ret:
-                QMessageBox.warning(self, "Capture Failed", "Could not capture frame from camera.")
+                QMessageBox.warning(self, "Kamera", "Es konnte kein Bild von der Kamera aufgenommen werden.")
                 return
         worker = SingleYOLOWorker(self.yolo_model, frame)
         worker.image_update.connect(self.update_camera_feed)
@@ -1019,54 +992,45 @@ class MainWindow(QMainWindow):
 
     def update_detections(self, desc):
         self.latest_visual_context = desc
-        self.vision_status.setText(f"Seeing: {desc}")
+        self.vision_status.setText(f"Erkannt: {desc}")
 
     def open_voice_settings(self):
-        dialog = VoiceSettingsDialog(self)
-        # PyQt6 uses QDialog.DialogCode.Accepted for exec() return code
+        dialog = VoiceSettingsDialog(self.speech_output, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            settings = QSettings('YourOrg', 'SpeechToText')
-            language = dialog.lang_cb.currentText()
-            gender = dialog.gender_cb.currentText()
-            voice_id = dialog.voice_cb.currentData() or ''
-            rate = dialog.rate_slider.value()
-            volume = dialog.volume_slider.value()
-            settings.setValue('tts/language', language)
-            settings.setValue('tts/gender', gender)
-            settings.setValue('tts/voice_id', voice_id)
-            settings.setValue('tts/rate', rate)
-            settings.setValue('tts/volume', volume)
-            self.tts_language = language
-            self.tts_gender = gender
-            self.tts_voice_id = voice_id
-            self.tts_rate = rate
-            self.tts_volume = volume / 100.0
-            # Show selected voice in status bar
-            try:
-                vname = dialog.voice_cb.currentText()
-                self.statusBar().showMessage(f"TTS voice set: {vname}")
-            except Exception:
-                pass
+            tts = dialog.get_settings()
+            save_tts_settings(tts)
+            self.speech_output.settings = tts
+            self.speech_output.preload()
+            voice = dialog.piper_cb.currentText() if tts.engine == tts_engine.ENGINE_PIPER else dialog.system_cb.currentText()
+            self.statusBar().showMessage(f"Sprachausgabe: {voice}", 5000)
+
+    def on_speak_responses_toggled(self, checked):
+        self.speak_responses = checked
+        if not checked:
+            self.stop_speaking()
+
+    def stop_speaking(self):
+        self.speech_output.stop()
 
     def open_assistant_settings(self):
         dialog = AssistantSettingsDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            mode, custom, use_docs, use_visual, memory_turns, max_tokens = dialog.get_values()
+            values = dialog.get_values()
             settings = QSettings('YourOrg', 'SpeechToText')
-            settings.setValue('assistant/personality_mode', mode)
-            settings.setValue('assistant/custom_personality', custom)
-            settings.setValue('assistant/use_docs', use_docs)
-            settings.setValue('assistant/use_visual', use_visual)
-            settings.setValue('assistant/memory_turns', memory_turns)
-            settings.setValue('assistant/max_tokens', max_tokens)
-            self.llm_worker.memory_turns = memory_turns
-            self.llm_worker.num_predict = max_tokens
-            self.assistant_personality_mode = mode
-            self.assistant_custom_personality = custom
-            self.use_docs = bool(use_docs)
-            self.use_visual = bool(use_visual)
-            self.personality_text = _personality_text_from_mode(mode, custom)
-            self.statusBar().showMessage(f"Assistant personality set: {mode}")
+            for key, value in values.items():
+                settings.setValue(f'assistant/{key}', value)
+            # Applied to the next request without restart
+            self.llm_worker.model_name = values['model']
+            self.llm_worker.memory_turns = values['memory_turns']
+            self.llm_worker.num_predict = values['max_tokens']
+            self.answer_language = values['answer_language']
+            self.assistant_personality_mode = values['personality_mode']
+            self.assistant_custom_personality = values['custom_personality']
+            self.use_docs = values['use_docs']
+            self.use_visual = values['use_visual']
+            self.personality_text = _personality_text_from_mode(values['personality_mode'],
+                                                                values['custom_personality'])
+            self.statusBar().showMessage(f"Assistent: {values['model']}", 5000)
 
     # ------------------------------------------------------------------ speech input
 
@@ -1076,7 +1040,7 @@ class MainWindow(QMainWindow):
             values = dialog.get_values()
             save_speech_settings(values)
             self.statusBar().showMessage(
-                f"Speech input: {values['model_size']} model, language {values['language']}", 5000)
+                f"Spracheingabe: Modell {values['model_size']}, Sprache {values['language']}", 5000)
 
     def _get_transcriber(self, cfg):
         """Reuse the loaded Whisper model unless model or device changed."""
@@ -1104,8 +1068,8 @@ class MainWindow(QMainWindow):
             self.speech_worker.stop_recording()
             return
 
-        # Don't let queued speech output talk over the user
-        self.tts_manager.clear()
+        # Don't let the assistant talk over the user
+        self.speech_output.stop()
         cfg = load_speech_settings()
         self.speech_worker = SpeechWorker(
             self._get_transcriber(cfg),
@@ -1127,20 +1091,20 @@ class MainWindow(QMainWindow):
 
     def on_speech_state(self, state):
         if state == 'recording':
-            self.mic_btn.setText("Stop")
+            self.mic_btn.setText("Stopp")
             self.mic_level.setValue(0)
             self.mic_level.setVisible(True)
-            self.statusBar().showMessage("Listening... (press Stop or Ctrl+Space when done)")
+            self.statusBar().showMessage("Ich höre zu … (fertig? „Stopp“ oder Strg+Leertaste)")
         elif state == 'transcribing':
             self.mic_btn.setText("...")
             self.mic_btn.setEnabled(False)
             self.mic_level.setVisible(False)
-            self.statusBar().showMessage("Transcribing...")
+            self.statusBar().showMessage("Erkenne Sprache …")
 
     def on_speech_text(self, text):
         self.statusBar().clearMessage()
         if not text:
-            self.statusBar().showMessage("No speech recognized.", 4000)
+            self.statusBar().showMessage("Keine Sprache erkannt.", 4000)
             return
         current = self.input_field.text().strip()
         self.input_field.setText(f"{current} {text}".strip())
@@ -1151,13 +1115,13 @@ class MainWindow(QMainWindow):
 
     def on_speech_failed(self, message):
         self.statusBar().clearMessage()
-        QMessageBox.warning(self, "Speech Input", f"Speech input failed:\n{message}")
+        QMessageBox.warning(self, "Spracheingabe", f"Die Spracheingabe hat nicht funktioniert:\n{message}")
 
     def on_speech_finished(self):
         if self.speech_worker is not None:
             self.speech_worker.deleteLater()
         self.speech_worker = None
-        self.mic_btn.setText("Speak")
+        self.mic_btn.setText("Sprechen")
         self.mic_btn.setEnabled(True)
         self.mic_level.setVisible(False)
         if self.pending_requests:
@@ -1166,8 +1130,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ documents
 
     def add_document(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Document", "",
-                                                   "Documents (*.pdf *.txt *.md *.csv)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Dokument auswählen", "",
+                                                   "Dokumente (*.pdf *.txt *.md *.csv)")
         if not file_path:
             return
         # Copy to documents folder for persistence (overwrites an older file with the same name)
@@ -1178,19 +1142,19 @@ class MainWindow(QMainWindow):
             if os.path.abspath(file_path) != os.path.abspath(dest_path):
                 shutil.copy2(file_path, dest_path)
         except Exception as e:
-            self.append_system_message(f"Error copying {filename}: {e}")
+            self.append_system_message(f"Fehler beim Kopieren von {filename}: {e}")
             return
 
-        self.append_system_message(f"Adding {filename}... please wait.")
+        self.append_system_message(f"Füge {filename} hinzu … bitte warten.")
         worker = IngestWorker(dest_path)
         worker.ingest_finished.connect(self.on_ingest_finished)
         self._start_bg_worker(worker)
 
     def on_ingest_finished(self, filename, success):
         if success:
-            self.append_system_message(f"Added {filename} successfully.")
+            self.append_system_message(f"{filename} wurde hinzugefügt.")
         else:
-            self.append_system_message(f"Failed to add {filename}. Check console.")
+            self.append_system_message(f"{filename} konnte nicht hinzugefügt werden (Details in der Konsole).")
 
     def append_system_message(self, text):
         self.chat_display.append(f"<i>System: {html.escape(text)}</i>")
@@ -1206,10 +1170,10 @@ class MainWindow(QMainWindow):
         self.session_list.blockSignals(True)
         self.session_list.clear()
         for session_id, start_time, title in sessions:
-            title = (title or "(no messages)").strip().replace("\n", " ")
+            title = (title or "(keine Nachrichten)").strip().replace("\n", " ")
             if len(title) > 60:
                 title = title[:57] + "..."
-            date = str(start_time or "")[:16]
+            date = _format_date(start_time)
             item = QListWidgetItem(f"{title}\n{date}")
             item.setData(Qt.ItemDataRole.UserRole, session_id)
             item.setToolTip(title)
@@ -1220,14 +1184,14 @@ class MainWindow(QMainWindow):
         self.session_list.blockSignals(False)
 
     def _reset_chat_view(self):
-        self.tts_manager.clear()
+        self.speech_output.stop()
         self._stream = None
         self.chat_display.clear()
 
     def start_new_session(self):
         self.session_id = str(uuid.uuid4())
         self._reset_chat_view()
-        self.append_system_message("New session started.")
+        self.append_system_message("Neues Gespräch gestartet.")
         self.session_list.clearSelection()
 
     def on_session_clicked(self, item):
@@ -1250,11 +1214,11 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         menu = QMenu(self)
-        delete_action = menu.addAction("Delete Session")
+        delete_action = menu.addAction("Gespräch löschen")
         if menu.exec(self.session_list.mapToGlobal(pos)) == delete_action:
             session_id = item.data(Qt.ItemDataRole.UserRole)
-            answer = QMessageBox.question(self, "Delete Session",
-                                          "Delete this conversation permanently?")
+            answer = QMessageBox.question(self, "Gespräch löschen",
+                                          "Dieses Gespräch endgültig löschen?")
             if answer == QMessageBox.StandardButton.Yes:
                 database_manager.delete_session(session_id)
                 if session_id == self.session_id:
@@ -1268,15 +1232,15 @@ class MainWindow(QMainWindow):
         bar.setValue(bar.maximum())
 
     def append_user_message(self, text):
-        self.chat_display.append(f"<b>You:</b> {html.escape(text)}")
+        self.chat_display.append(f"<b>Du:</b> {html.escape(text)}")
         self._scroll_chat_to_bottom()
 
     def append_assistant_message(self, text, error=False):
         if error:
             body = html.escape(text).replace("\n", "<br>")
-            self.chat_display.append(f"<b>Assistant:</b> <span style='color:#c0392b'>{body}</span>")
+            self.chat_display.append(f"<b>Assistent:</b> <span style='color:#c0392b'>{body}</span>")
         else:
-            self.chat_display.append("<b>Assistant:</b>")
+            self.chat_display.append("<b>Assistent:</b>")
             cursor = QTextCursor(self.chat_display.document())
             cursor.movePosition(QTextCursor.MoveOperation.End)
             cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
@@ -1290,7 +1254,7 @@ class MainWindow(QMainWindow):
 
     def _update_thinking_status(self):
         if self.pending_requests > 0:
-            self.statusBar().showMessage(f"Assistant is thinking... ({self.pending_requests} pending)")
+            self.statusBar().showMessage(f"Assistent denkt nach … ({self.pending_requests} offen)")
         else:
             self.statusBar().clearMessage()
 
@@ -1318,22 +1282,14 @@ class MainWindow(QMainWindow):
             message_id=message_id,
             personality=self.personality_text,
             use_docs=self.use_docs,
-            use_visual=self.use_visual
+            use_visual=self.use_visual,
+            answer_language=self.answer_language,
         )
 
     def _speak(self, text):
-        text = clean_for_speech(text)
-        if not (self.speak_responses and text):
-            return
-        try:
-            self.tts_manager.speak(
-                text,
-                voice_id=(self.tts_voice_id or None),
-                rate=(self.tts_rate or None),
-                volume=self.tts_volume
-            )
-        except Exception as e:
-            print(f"Failed to enqueue TTS: {e}")
+        text = prepare_for_speech(text)
+        if self.speak_responses and text:
+            self.speech_output.speak(text)
 
     def on_response_chunk(self, request_id, session_id, text):
         if session_id != self.session_id:
@@ -1342,7 +1298,7 @@ class MainWindow(QMainWindow):
             # First chunk: open a new "Assistant:" paragraph and keep a cursor to it.
             # The cursor stays inside this paragraph even if the user sends another
             # message meanwhile (which is appended below it).
-            self.chat_display.append("<b>Assistant:</b>")
+            self.chat_display.append("<b>Assistent:</b>")
             cursor = QTextCursor(self.chat_display.document())
             cursor.movePosition(QTextCursor.MoveOperation.End)
             cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
@@ -1391,13 +1347,26 @@ class MainWindow(QMainWindow):
             self.speech_worker.stop_recording()
             self.speech_worker.wait(5000)
         self.llm_worker.stop()
+        self.speech_output.shutdown()
         for worker in list(self._bg_workers):
             worker.wait(2000)
         super().closeEvent(event)
 
 
+def install_german_translations(app):
+    """German texts for Qt's standard dialogs and buttons (Ja/Nein, Abbrechen, Öffnen, ...)."""
+    from PyQt6.QtCore import QTranslator, QLibraryInfo, QLocale
+    QLocale.setDefault(QLocale(QLocale.Language.German, QLocale.Country.Germany))
+    translator = QTranslator(app)
+    path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+    if translator.load("qtbase_de", path):
+        app.installTranslator(translator)
+    return translator
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    install_german_translations(app)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

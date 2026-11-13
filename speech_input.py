@@ -3,6 +3,7 @@ Local speech input: microphone recording (PyAudio) + transcription (faster-whisp
 
 Everything here is GUI-independent so it can be tested without Qt.
 """
+import re
 import threading
 
 import numpy as np
@@ -10,9 +11,46 @@ import numpy as np
 SAMPLE_RATE = 16000          # Whisper expects 16 kHz mono
 CHUNK_SECONDS = 0.064        # ~64 ms per read
 
-MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo"]
-DEFAULT_MODEL_SIZE = "small"
-LANGUAGES = {"Auto": None, "German": "de", "English": "en"}
+# (model, label) – large-v3-turbo gives by far the best German results and is fast on a GPU
+MODEL_SIZES = [
+    ("large-v3-turbo", "large-v3-turbo – beste Qualität (empfohlen, GPU)"),
+    ("large-v3", "large-v3 – sehr genau, langsamer"),
+    ("medium", "medium – gut, auch auf CPU nutzbar"),
+    ("small", "small – schnell, weniger genau"),
+    ("base", "base – sehr schnell, ungenau"),
+]
+DEFAULT_MODEL_SIZE = "large-v3-turbo"
+
+LANGUAGES = {"Deutsch": "de", "Automatisch erkennen": None, "Englisch": "en"}
+DEFAULT_LANGUAGE = "Deutsch"
+# Values stored by older versions of the app
+LEGACY_LANGUAGE_NAMES = {"German": "Deutsch", "Auto": "Automatisch erkennen", "English": "Englisch"}
+
+# A short German example text as context makes Whisper use German spelling,
+# capitalization and punctuation more consistently.
+GERMAN_INITIAL_PROMPT = "Hallo! Ich habe eine Frage: Kannst du mir bitte helfen, z. B. mit einem Termin am 3. März?"
+
+# Phrases Whisper is known to "hallucinate" on silence or noise in German
+# (learned from TV subtitles). They are only removed at the END of a transcript,
+# where Whisper appends them, so normal sentences are never changed.
+_HALLUCINATION_PATTERNS = [
+    r"untertitel(ung)? (im auftrag )?(des|der) (zdf|ard|wdr|ndr|swr|br|mdr)( f(ü|ue)r funk)?(,? \d{4})?",
+    r"untertitel der amara\.org-community",
+    r"untertitel von stephanie geiges",
+    r"(vielen )?dank f(ü|ue)r'?s? (zuschauen|zusehen)",
+    r"copyright (wdr|ndr|swr|zdf|ard|br|mdr)( \d{4})?",
+]
+_HALLUCINATION_RE = re.compile(
+    r"[\s,]*(" + "|".join(_HALLUCINATION_PATTERNS) + r")[.!?\s]*$", re.IGNORECASE)
+
+
+def remove_hallucinations(text: str) -> str:
+    """Remove typical Whisper hallucination phrases (TV subtitle credits) from the end of a transcript."""
+    previous = None
+    while previous != text:  # several phrases can be stacked
+        previous = text
+        text = _HALLUCINATION_RE.sub("", text).strip()
+    return text
 
 
 # --------------------------------------------------------------------------- devices
@@ -204,9 +242,13 @@ class Transcriber:
             language=language,
             beam_size=5,
             vad_filter=True,  # ignore leading/trailing silence and noise
+            initial_prompt=GERMAN_INITIAL_PROMPT if language == "de" else None,
+            condition_on_previous_text=False,  # avoids repetition loops
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        print(f"Transcribed ({info.language}, {info.duration:.1f}s): {text}")
+        raw = " ".join(seg.text.strip() for seg in segments).strip()
+        text = remove_hallucinations(raw)
+        print(f"Transcribed ({info.language}, {info.duration:.1f}s): {text}"
+              + (f"  [removed: {raw!r}]" if text != raw else ""))
         return text
 
     def transcribe(self, audio: np.ndarray, language=None) -> str:

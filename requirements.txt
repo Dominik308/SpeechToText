@@ -13,8 +13,10 @@ pypdf
 opencv-python
 ultralytics
 
-# Speech input (local speech recognition) and output
+# Speech input (local speech recognition, faster-whisper) and output (Piper voices, system voice fallback)
 faster-whisper
+piper-tts
+huggingface-hub
 numpy
 pyaudio
 pyttsx3

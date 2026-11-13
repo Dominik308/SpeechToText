@@ -159,3 +159,46 @@ def test_transcriber_ignores_too_short_audio(monkeypatch):
     created = install_fake_whisper(monkeypatch)
     assert speech_input.Transcriber().transcribe(np.zeros(100, np.float32)) == ""
     assert created == []  # model not even loaded
+
+
+# ----------------------------------------------------------------- German specifics
+
+def test_german_is_default():
+    assert speech_input.DEFAULT_MODEL_SIZE == "large-v3-turbo"
+    assert speech_input.LANGUAGES[speech_input.DEFAULT_LANGUAGE] == "de"
+    assert speech_input.MODEL_SIZES[0][0] == "large-v3-turbo"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("Wie wird das Wetter morgen? Untertitel im Auftrag des ZDF für funk, 2017", "Wie wird das Wetter morgen?"),
+    ("Untertitel der Amara.org-Community", ""),
+    ("Vielen Dank fürs Zuschauen!", ""),
+    ("Mach das Licht an. Untertitelung des ZDF, 2020 Copyright WDR 2021", "Mach das Licht an."),
+    # normal sentences stay untouched, even with similar words
+    ("Erstelle Untertitel von dem Video.", "Erstelle Untertitel von dem Video."),
+    ("Untertitel im Auftrag des ZDF sind schlecht, oder?", "Untertitel im Auftrag des ZDF sind schlecht, oder?"),
+    ("Danke für die Hilfe!", "Danke für die Hilfe!"),
+])
+def test_remove_hallucinations(raw, expected):
+    assert speech_input.remove_hallucinations(raw) == expected
+
+
+def test_german_prompt_and_hallucination_filter_are_used(monkeypatch):
+    calls = []
+
+    class WhisperModel:
+        def __init__(self, size, device, compute_type):
+            pass
+
+        def transcribe(self, audio, **kwargs):
+            calls.append(kwargs)
+            info = types.SimpleNamespace(language="de", duration=1.0)
+            return iter([FakeSegment(" Hallo."), FakeSegment(" Vielen Dank fürs Zuschauen!")]), info
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=WhisperModel))
+    t = speech_input.Transcriber()
+    assert t.transcribe(tone(1, 16000), language="de") == "Hallo."
+    assert calls[0]["language"] == "de"
+    assert calls[0]["initial_prompt"] == speech_input.GERMAN_INITIAL_PROMPT
+    t.transcribe(tone(1, 16000), language="en")
+    assert calls[1]["initial_prompt"] is None
